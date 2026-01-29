@@ -2,7 +2,6 @@
 //!
 //! Tests program loading, execution, and helper integration.
 
-use axebpf::maps::{self, MapDef, MapType};
 use axebpf::runtime::{self, EbpfProgram};
 
 /// Simple program: mov r0, 42; exit

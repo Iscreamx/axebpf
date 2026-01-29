@@ -2,7 +2,7 @@
 //!
 //! Tests helper registration and basic functionality.
 
-use axebpf::helpers::{self, HelperFn, SUPPORTED_HELPERS, id};
+use axebpf::helpers::{self, SUPPORTED_HELPERS, id};
 use axebpf::maps::{self, MapDef, MapType};
 
 // =============================================================================
