@@ -3,8 +3,7 @@ name = "axebpf"
 version = "0.1.0"
 edition = "2024"
 description = "eBPF runtime, symbol table, and tracepoint framework for AxVisor"
-authors = ["AxVisor Developers"]
-license = "GPL-3.0-or-later OR Apache-2.0"
+authors = ["iscreamx404@gmail.com"]
 
 [features]
 default = ["symbols", "tracepoint-support", "runtime", "axhal"]
