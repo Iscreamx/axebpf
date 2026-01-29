@@ -1,9 +1,15 @@
 //! eBPF Map data structures.
 //!
 //! Wraps kbpf-basic to provide Map storage for eBPF programs.
+//! API remains compatible with the previous simplified implementation.
 
 use alloc::vec::Vec;
-use spin::Mutex;
+
+use kbpf_basic::linux_bpf::BpfMapType;
+use kbpf_basic::map::{BpfMapMeta, UnifiedMap, bpf_map_create};
+use kbpf_basic::{BpfError, KernelAuxiliaryOps};
+
+use crate::map_ops::{AxKernelAuxOps, DummyPerCpuOps, map_count, register_map, unregister_map};
 
 /// Map type enumeration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,73 +66,39 @@ impl core::fmt::Display for Error {
 
 impl core::error::Error for Error {}
 
-/// Internal map storage using simple Vec-based implementation.
-struct MapStorage {
-    def: MapDef,
-    data: Vec<(Vec<u8>, Vec<u8>)>,
-}
-
-impl MapStorage {
-    fn new(def: MapDef) -> Self {
-        Self {
-            def,
-            data: Vec::new(),
+impl From<BpfError> for Error {
+    fn from(e: BpfError) -> Self {
+        match e {
+            BpfError::NotFound => Error::NotFound,
+            BpfError::NoSpace => Error::NoSpace,
+            BpfError::InvalidArgument => Error::InvalidArgument,
+            BpfError::NotSupported => Error::NotSupported,
+            BpfError::TryAgain => Error::InvalidArgument,
+            BpfError::TooBig => Error::InvalidArgument,
         }
-    }
-
-    fn lookup(&self, key: &[u8]) -> Option<Vec<u8>> {
-        for (k, v) in &self.data {
-            if k == key {
-                return Some(v.clone());
-            }
-        }
-        None
-    }
-
-    fn update(&mut self, key: &[u8], value: &[u8], _flags: u64) -> Result<(), Error> {
-        // Check sizes
-        if key.len() != self.def.key_size as usize {
-            return Err(Error::InvalidArgument);
-        }
-        if value.len() != self.def.value_size as usize {
-            return Err(Error::InvalidArgument);
-        }
-
-        // Update existing or insert new
-        for (k, v) in &mut self.data {
-            if k == key {
-                *v = value.to_vec();
-                return Ok(());
-            }
-        }
-
-        // Check capacity
-        if self.data.len() >= self.def.max_entries as usize {
-            // For LRU, evict first entry
-            if self.def.map_type == MapType::LruHash {
-                self.data.remove(0);
-            } else {
-                return Err(Error::NoSpace);
-            }
-        }
-
-        self.data.push((key.to_vec(), value.to_vec()));
-        Ok(())
-    }
-
-    fn delete(&mut self, key: &[u8]) -> Result<(), Error> {
-        for i in 0..self.data.len() {
-            if self.data[i].0 == key {
-                self.data.remove(i);
-                return Ok(());
-            }
-        }
-        Err(Error::KeyNotFound)
     }
 }
 
-/// Global map registry.
-static MAP_REGISTRY: Mutex<Vec<Option<MapStorage>>> = Mutex::new(Vec::new());
+/// Convert MapType to kbpf-basic BpfMapType.
+fn to_bpf_map_type(map_type: MapType) -> BpfMapType {
+    match map_type {
+        MapType::Array => BpfMapType::BPF_MAP_TYPE_ARRAY,
+        MapType::HashMap => BpfMapType::BPF_MAP_TYPE_HASH,
+        MapType::LruHash => BpfMapType::BPF_MAP_TYPE_LRU_HASH,
+        MapType::Queue => BpfMapType::BPF_MAP_TYPE_QUEUE,
+    }
+}
+
+/// Convert MapDef to kbpf-basic BpfMapMeta.
+fn to_bpf_map_meta(def: &MapDef) -> BpfMapMeta {
+    BpfMapMeta {
+        map_type: to_bpf_map_type(def.map_type),
+        key_size: def.key_size,
+        value_size: def.value_size,
+        max_entries: def.max_entries,
+        ..Default::default()
+    }
+}
 
 /// Create a new map and return its ID.
 ///
@@ -136,20 +108,14 @@ static MAP_REGISTRY: Mutex<Vec<Option<MapStorage>>> = Mutex::new(Vec::new());
 /// # Returns
 /// Map ID on success.
 pub fn create(def: &MapDef) -> Result<u32, Error> {
-    let mut registry = MAP_REGISTRY.lock();
-    let storage = MapStorage::new(def.clone());
+    let meta = to_bpf_map_meta(def);
 
-    // Find empty slot or append
-    for (i, slot) in registry.iter_mut().enumerate() {
-        if slot.is_none() {
-            *slot = Some(storage);
-            log::debug!("Created map {} with type {:?}", i, def.map_type);
-            return Ok(i as u32);
-        }
-    }
+    // Create the map using kbpf-basic
+    // No PollWaker needed for basic map types (only RingBuf needs it)
+    let unified_map =
+        bpf_map_create::<AxKernelAuxOps, DummyPerCpuOps>(meta, None).map_err(Error::from)?;
 
-    let id = registry.len() as u32;
-    registry.push(Some(storage));
+    let id = register_map(unified_map);
     log::debug!("Created map {} with type {:?}", id, def.map_type);
     Ok(id)
 }
@@ -163,8 +129,15 @@ pub fn create(def: &MapDef) -> Result<u32, Error> {
 /// # Returns
 /// Value bytes if found.
 pub fn lookup_elem(map_id: u32, key: &[u8]) -> Option<Vec<u8>> {
-    let registry = MAP_REGISTRY.lock();
-    registry.get(map_id as usize)?.as_ref()?.lookup(key)
+    AxKernelAuxOps::get_unified_map_from_fd(map_id, |unified_map: &mut UnifiedMap| {
+        let result = unified_map.map_mut().lookup_elem(key)?;
+        match result {
+            Some(value) => Ok(Some(value.to_vec())),
+            None => Ok(None),
+        }
+    })
+    .ok()
+    .flatten()
 }
 
 /// Update an element in a map.
@@ -175,13 +148,10 @@ pub fn lookup_elem(map_id: u32, key: &[u8]) -> Option<Vec<u8>> {
 /// * `value` - Value bytes.
 /// * `flags` - Update flags (0 = create or update).
 pub fn update_elem(map_id: u32, key: &[u8], value: &[u8], flags: u64) -> Result<(), Error> {
-    let mut registry = MAP_REGISTRY.lock();
-    let storage = registry
-        .get_mut(map_id as usize)
-        .ok_or(Error::NotFound)?
-        .as_mut()
-        .ok_or(Error::NotFound)?;
-    storage.update(key, value, flags)
+    AxKernelAuxOps::get_unified_map_from_fd(map_id, |unified_map: &mut UnifiedMap| {
+        unified_map.map_mut().update_elem(key, value, flags)
+    })
+    .map_err(Error::from)
 }
 
 /// Delete an element from a map.
@@ -190,29 +160,20 @@ pub fn update_elem(map_id: u32, key: &[u8], value: &[u8], flags: u64) -> Result<
 /// * `map_id` - Map ID.
 /// * `key` - Key bytes.
 pub fn delete_elem(map_id: u32, key: &[u8]) -> Result<(), Error> {
-    let mut registry = MAP_REGISTRY.lock();
-    let storage = registry
-        .get_mut(map_id as usize)
-        .ok_or(Error::NotFound)?
-        .as_mut()
-        .ok_or(Error::NotFound)?;
-    storage.delete(key)
+    AxKernelAuxOps::get_unified_map_from_fd(map_id, |unified_map: &mut UnifiedMap| {
+        unified_map.map_mut().delete_elem(key)
+    })
+    .map_err(Error::from)
 }
 
 /// Get the number of maps in the registry.
 pub fn count() -> usize {
-    let registry = MAP_REGISTRY.lock();
-    registry.iter().filter(|s| s.is_some()).count()
+    map_count()
 }
 
 /// Delete a map by ID.
 pub fn destroy(map_id: u32) -> Result<(), Error> {
-    let mut registry = MAP_REGISTRY.lock();
-    let slot = registry.get_mut(map_id as usize).ok_or(Error::NotFound)?;
-    if slot.is_none() {
-        return Err(Error::NotFound);
-    }
-    *slot = None;
+    unregister_map(map_id).map_err(Error::from)?;
     log::debug!("Destroyed map {}", map_id);
     Ok(())
 }
