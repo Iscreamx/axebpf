@@ -26,22 +26,29 @@ axebpf/
 │   ├── maps.rs             # eBPF map implementations (Array, HashMap, LRU, Queue)
 │   ├── helpers.rs          # Standard eBPF helper functions
 │   ├── attach.rs           # Program attachment management
-│   ├── kops.rs             # Kernel operations interface (AxKops)
+│   ├── trace_ops.rs        # Tracepoint operations (KernelTraceOps)
+│   ├── map_ops.rs          # Map operations (KernelAuxiliaryOps for kbpf-basic)
 │   ├── macros.rs           # Helper macros
 │   ├── examples/           # Usage examples
-│   │   └── mod.rs
+│   │   ├── mod.rs
+│   │   └── runtime_example.rs
 │   └── tracepoints/        # VMM-specific tracepoints
 │       ├── mod.rs          # VMM tracepoint exports
-│       ├── definitions.rs  # Tracepoint definitions
+│       ├── vmm.rs          # VMM tracepoint definitions (vm, vcpu, memory, etc.)
+│       ├── shell.rs        # Shell tracepoint definitions
 │       ├── stats.rs        # Built-in statistics collector
 │       ├── histogram.rs    # Latency distribution histograms
 │       └── hypervisor_helpers.rs  # Hypervisor-specific eBPF helpers
 └── tests/
-    ├── runtime_tests.rs    # Runtime/program tests
-    ├── maps_tests.rs       # Map CRUD tests
-    ├── helpers_tests.rs    # Helper function tests
-    ├── attach_tests.rs     # Program attachment tests
-    └── symbols_tests.rs    # Symbol table tests
+    ├── runtime_tests.rs           # Runtime/program tests
+    ├── maps_tests.rs              # Map CRUD tests
+    ├── helpers_tests.rs           # Helper function tests
+    ├── hypervisor_helpers_tests.rs # Hypervisor helper tests
+    ├── attach_tests.rs            # Program attachment tests
+    ├── symbols_tests.rs           # Symbol table tests
+    ├── tracepoint_tests.rs        # Tracepoint framework tests
+    ├── histogram_tests.rs         # Histogram tests
+    └── stats_tests.rs             # Statistics collector tests
 ```
 
 ## Dependencies
@@ -61,10 +68,11 @@ axebpf/
 
 ```toml
 [dependencies]
-axebpf = { path = "modules/axebpf" }
+# For external projects, use git reference
+axebpf = { git = "https://github.com/Iscreamx/axebpf.git" }
 
 # Or with specific features
-axebpf = { path = "modules/axebpf", features = ["tracepoint-support", "runtime"] }
+axebpf = { git = "https://github.com/Iscreamx/axebpf.git", features = ["tracepoint-support", "runtime"] }
 ```
 
 ### Feature Flags
