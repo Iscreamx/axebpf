@@ -1,0 +1,37 @@
+[package]
+name = "axebpf"
+version = "0.1.0"
+edition = "2024"
+description = "eBPF runtime, symbol table, and tracepoint framework for AxVisor"
+authors = ["AxVisor Developers"]
+license = "GPL-3.0-or-later OR Apache-2.0"
+
+[features]
+default = ["symbols", "tracepoint-support", "runtime", "axhal"]
+symbols = ["ksym"]
+tracepoint-support = ["symbols", "dep:tracepoint", "tp-lexer", "spin", "static-keys"]
+runtime = ["rbpf", "kbpf-basic", "spin"]
+axhal = ["dep:axhal"]
+
+[dependencies]
+log = "0.4"
+axerrno = "0.2"
+
+# kernel operations (time, cpu_id) - only needed in non-test builds
+axhal = { git = "https://github.com/arceos-org/arceos.git", tag = "dev-251216", optional = true }
+
+# symbols feature
+ksym = { git = "https://github.com/Starry-OS/ksym.git", optional = true }
+
+# tracepoint feature
+tracepoint = { git = "https://github.com/Starry-OS/tracepoint.git", package = "ktracepoint", optional = true }
+tp-lexer = { git = "https://github.com/Starry-OS/tp-lexer.git", optional = true }
+spin = { version = "0.9", optional = true }
+static-keys = { version = "0.8.2", default-features = false, optional = true }
+
+# runtime feature
+rbpf = { git = "https://github.com/qmonnet/rbpf", default-features = false, optional = true }
+kbpf-basic = { git = "https://github.com/Iscreamx/kbpf-basic.git", optional = true }
+
+[dev-dependencies]
+# For testing in user space (no kernel dependencies needed)
