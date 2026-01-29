@@ -30,7 +30,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 use tracepoint::{TracingEventsManager, global_init_events};
 
-use crate::kops::AxKops;
+use crate::trace_ops::AxKops;
 
 // Re-export KernelTraceOps for use in kernel code
 pub use tracepoint::KernelTraceOps;

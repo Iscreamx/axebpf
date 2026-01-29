@@ -9,7 +9,7 @@
 //! macro directly with AxVisor-specific types:
 //!
 //! ```ignore
-//! use axebpf::kops::AxKops;
+//! use axebpf::trace_ops::AxKops;
 //!
 //! tracepoint::define_event_trace!(
 //!     my_tracepoint,
@@ -28,7 +28,7 @@
 //!
 //! When defining tracepoints for AxVisor, use these types:
 //! - Lock: `spin::Mutex<()>`
-//! - KernelOps: `axebpf::kops::AxKops`
+//! - KernelOps: `axebpf::trace_ops::AxKops`
 
 // Re-export the define_event_trace macro for convenience
 pub use tracepoint::define_event_trace;

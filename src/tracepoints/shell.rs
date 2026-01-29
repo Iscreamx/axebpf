@@ -4,7 +4,7 @@
 //! - shell_init: Shell initialization
 //! - shell_command: Shell command execution
 
-use crate::kops::AxKops;
+use crate::trace_ops::AxKops;
 
 // =============================================================================
 // Shell Tracepoints

@@ -54,7 +54,7 @@ pub mod symbols;
 // =============================================================================
 
 #[cfg(feature = "tracepoint-support")]
-pub mod kops;
+pub mod trace_ops;
 
 #[cfg(feature = "tracepoint-support")]
 pub mod macros;
@@ -71,6 +71,9 @@ pub mod tracepoints;
 // =============================================================================
 // Runtime Module
 // =============================================================================
+
+#[cfg(feature = "runtime")]
+pub mod map_ops;
 
 #[cfg(feature = "runtime")]
 pub mod maps;

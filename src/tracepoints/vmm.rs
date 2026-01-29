@@ -9,7 +9,7 @@
 //! - System: vmm_init, vhal_init, config_load, image_load
 //! - Timer: timer_tick, timer_event, task_switch
 
-use crate::kops::AxKops;
+use crate::trace_ops::AxKops;
 
 // =============================================================================
 // VM Lifecycle Tracepoints
