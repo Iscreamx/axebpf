@@ -28,15 +28,22 @@ axebpf/
 │   ├── attach.rs           # Program attachment management
 │   ├── trace_ops.rs        # Tracepoint operations (KernelTraceOps)
 │   ├── map_ops.rs          # Map operations (KernelAuxiliaryOps for kbpf-basic)
+│   ├── context.rs          # eBPF program execution context
+│   ├── output.rs           # eBPF output buffer management
 │   ├── macros.rs           # Helper macros
 │   ├── examples/           # Usage examples
 │   │   ├── mod.rs
 │   │   └── runtime_example.rs
+│   ├── programs/           # eBPF program management
+│   │   ├── mod.rs          # Program module exports
+│   │   ├── bytecode.rs     # Bytecode utilities
+│   │   └── registry.rs     # Program registry
 │   └── tracepoints/        # VMM-specific tracepoints
 │       ├── mod.rs          # VMM tracepoint exports
 │       ├── vmm.rs          # VMM tracepoint definitions (vm, vcpu, memory, etc.)
 │       ├── shell.rs        # Shell tracepoint definitions
 │       ├── stats.rs        # Built-in statistics collector
+│       ├── registry.rs     # Tracepoint registry
 │       ├── histogram.rs    # Latency distribution histograms
 │       └── hypervisor_helpers.rs  # Hypervisor-specific eBPF helpers
 └── tests/
