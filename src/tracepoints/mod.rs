@@ -23,6 +23,7 @@
 
 pub mod histogram;
 pub mod hypervisor_helpers;
+pub mod registry;
 pub mod shell;
 pub mod stats;
 pub mod vmm;
@@ -71,11 +72,8 @@ pub use shell::{trace_shell_command, trace_shell_init};
 // Re-export histogram types
 pub use histogram::{BUCKET_BOUNDS_NS, BUCKET_LABELS, HistogramSnapshot, LatencyHistogram};
 
-// Re-export stats types and functions
-pub use stats::{
-    StatsManager, StatsSnapshot, TracepointStats, init_stats, record_duration, record_hit,
-    stats_manager,
-};
+// Re-export stats execution functions
+pub use stats::{execute_attached_program, record_duration, record_hit};
 
 // Re-export hypervisor helpers
 pub use hypervisor_helpers::{
@@ -85,6 +83,6 @@ pub use hypervisor_helpers::{
 
 /// Initialize tracepoints subsystem.
 pub fn init() {
-    stats::init_stats();
+    registry::init();
     log::info!("Tracepoints initialized");
 }
