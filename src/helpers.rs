@@ -3,7 +3,41 @@
 //! Standard helpers available to eBPF programs running in AxVisor.
 //! These follow Linux BPF helper IDs where applicable.
 
+use crate::map_ops;
 use crate::maps;
+use spin::Mutex;
+
+/// Static buffer for returning lookup results.
+/// Linux BPF returns a pointer to map-internal storage; we simulate this
+/// with a static buffer. Max value size supported: 256 bytes.
+pub const MAX_VALUE_SIZE: usize = 256;
+static LOOKUP_BUFFER: Mutex<[u8; MAX_VALUE_SIZE]> = Mutex::new([0u8; MAX_VALUE_SIZE]);
+
+/// Static buffer for returning tracepoint names.
+pub const MAX_NAME_SIZE: usize = 64;
+static NAME_BUFFER: Mutex<[u8; MAX_NAME_SIZE]> = Mutex::new([0u8; MAX_NAME_SIZE]);
+
+/// Get the memory range of LOOKUP_BUFFER for registering with rbpf VM.
+///
+/// This allows eBPF programs to access the buffer returned by bpf_map_lookup_elem.
+/// Must be called and registered before VM execution.
+///
+/// # Returns
+/// Memory range (start..end) of the static LOOKUP_BUFFER.
+pub fn get_lookup_buffer_range() -> core::ops::Range<u64> {
+    let buffer = LOOKUP_BUFFER.lock();
+    let start = buffer.as_ptr() as u64;
+    let end = start + MAX_VALUE_SIZE as u64;
+    start..end
+}
+
+/// Get the memory range of NAME_BUFFER for registering with rbpf VM.
+pub fn get_name_buffer_range() -> core::ops::Range<u64> {
+    let buffer = NAME_BUFFER.lock();
+    let start = buffer.as_ptr() as u64;
+    let end = start + MAX_NAME_SIZE as u64;
+    start..end
+}
 
 /// Helper function signature matching rbpf expectations.
 /// Arguments: r1, r2, r3, r4, r5 (from eBPF registers)
@@ -18,12 +52,16 @@ pub mod id {
     pub const MAP_UPDATE_ELEM: u32 = 2;
     /// bpf_map_delete_elem(map_id, key) -> 0 or error
     pub const MAP_DELETE_ELEM: u32 = 3;
+    /// bpf_probe_read(dst, size, src) -> 0 or error
+    pub const PROBE_READ: u32 = 4;
     /// bpf_ktime_get_ns() -> nanoseconds
     pub const KTIME_GET_NS: u32 = 5;
     /// bpf_trace_printk(fmt, fmt_size, args...) -> bytes written
     pub const TRACE_PRINTK: u32 = 6;
     /// bpf_get_smp_processor_id() -> CPU ID
     pub const GET_SMP_PROCESSOR_ID: u32 = 8;
+    /// bpf_get_tracepoint_name(tracepoint_id) -> name_ptr or 0
+    pub const GET_TRACEPOINT_NAME: u32 = 10;
 }
 
 // =============================================================================
@@ -32,17 +70,34 @@ pub mod id {
 
 /// bpf_map_lookup_elem - lookup map element by key.
 ///
-/// For simplified model: r1 = map_id, r2 = key (as u64 for small keys)
-/// Returns: value as u64, or 0 if not found.
-fn bpf_map_lookup_elem(map_id: u64, key: u64, _r3: u64, _r4: u64, _r5: u64) -> u64 {
-    let key_bytes = key.to_le_bytes();
-    match maps::lookup_elem(map_id as u32, &key_bytes) {
+/// Linux/Aya semantics:
+/// - r1 = map_fd (from ld_map_fd instruction)
+/// - r2 = pointer to key (on eBPF stack)
+///
+/// Returns: pointer to value in static buffer, or 0 if not found.
+///
+/// SAFETY: Assumes eBPF program is trusted and pointers are valid.
+fn bpf_map_lookup_elem(map_fd: u64, key_ptr: u64, _r3: u64, _r4: u64, _r5: u64) -> u64 {
+    // Get key_size from Map metadata
+    let Some((key_size, _value_size)) = map_ops::get_map_sizes(map_fd as u32) else {
+        log::warn!("bpf_map_lookup_elem: map {} not found", map_fd);
+        return 0;
+    };
+
+    // Read key from pointer (UNSAFE: trusting eBPF program)
+    let key_bytes = unsafe {
+        let ptr = key_ptr as *const u8;
+        core::slice::from_raw_parts(ptr, key_size as usize)
+    };
+
+    // Lookup in map
+    match maps::lookup_elem(map_fd as u32, key_bytes) {
         Some(value) => {
-            // Return first 8 bytes as u64
-            let mut buf = [0u8; 8];
-            let len = value.len().min(8);
-            buf[..len].copy_from_slice(&value[..len]);
-            u64::from_le_bytes(buf)
+            // Copy value to static buffer and return pointer
+            let mut buffer = LOOKUP_BUFFER.lock();
+            let len = value.len().min(MAX_VALUE_SIZE);
+            buffer[..len].copy_from_slice(&value[..len]);
+            buffer.as_ptr() as u64
         }
         None => 0,
     }
@@ -50,26 +105,57 @@ fn bpf_map_lookup_elem(map_id: u64, key: u64, _r3: u64, _r4: u64, _r5: u64) -> u
 
 /// bpf_map_update_elem - update or insert map element.
 ///
-/// r1 = map_id, r2 = key, r3 = value, r4 = flags
-/// Returns: 0 on success, non-zero on error.
-fn bpf_map_update_elem(map_id: u64, key: u64, value: u64, flags: u64, _r5: u64) -> u64 {
-    let key_bytes = key.to_le_bytes();
-    let value_bytes = value.to_le_bytes();
-    match maps::update_elem(map_id as u32, &key_bytes, &value_bytes, flags) {
+/// Linux/Aya semantics:
+/// - r1 = map_fd
+/// - r2 = pointer to key
+/// - r3 = pointer to value
+/// - r4 = flags (0 = create or update)
+///
+/// Returns: 0 on success, negative on error.
+///
+/// SAFETY: Assumes eBPF program is trusted and pointers are valid.
+fn bpf_map_update_elem(map_fd: u64, key_ptr: u64, value_ptr: u64, flags: u64, _r5: u64) -> u64 {
+    // Get sizes from Map metadata
+    let Some((key_size, value_size)) = map_ops::get_map_sizes(map_fd as u32) else {
+        log::warn!("bpf_map_update_elem: map {} not found", map_fd);
+        return (-1i64) as u64;
+    };
+
+    // Read key and value from pointers (UNSAFE: trusting eBPF program)
+    let (key_bytes, value_bytes) = unsafe {
+        let key = core::slice::from_raw_parts(key_ptr as *const u8, key_size as usize);
+        let value = core::slice::from_raw_parts(value_ptr as *const u8, value_size as usize);
+        (key, value)
+    };
+
+    match maps::update_elem(map_fd as u32, key_bytes, value_bytes, flags) {
         Ok(()) => 0,
-        Err(_) => 1,
+        Err(_) => (-1i64) as u64,
     }
 }
 
 /// bpf_map_delete_elem - delete map element.
 ///
-/// r1 = map_id, r2 = key
-/// Returns: 0 on success, non-zero on error.
-fn bpf_map_delete_elem(map_id: u64, key: u64, _r3: u64, _r4: u64, _r5: u64) -> u64 {
-    let key_bytes = key.to_le_bytes();
-    match maps::delete_elem(map_id as u32, &key_bytes) {
+/// Linux/Aya semantics:
+/// - r1 = map_fd
+/// - r2 = pointer to key
+///
+/// Returns: 0 on success, negative on error.
+///
+/// SAFETY: Assumes eBPF program is trusted and pointers are valid.
+fn bpf_map_delete_elem(map_fd: u64, key_ptr: u64, _r3: u64, _r4: u64, _r5: u64) -> u64 {
+    // Get key_size from Map metadata
+    let Some((key_size, _value_size)) = map_ops::get_map_sizes(map_fd as u32) else {
+        log::warn!("bpf_map_delete_elem: map {} not found", map_fd);
+        return (-1i64) as u64;
+    };
+
+    // Read key from pointer (UNSAFE: trusting eBPF program)
+    let key_bytes = unsafe { core::slice::from_raw_parts(key_ptr as *const u8, key_size as usize) };
+
+    match maps::delete_elem(map_fd as u32, key_bytes) {
         Ok(()) => 0,
-        Err(_) => 1,
+        Err(_) => (-1i64) as u64,
     }
 }
 
@@ -82,10 +168,25 @@ fn bpf_ktime_get_ns(_r1: u64, _r2: u64, _r3: u64, _r4: u64, _r5: u64) -> u64 {
 
 /// bpf_trace_printk - print debug message.
 ///
-/// Simplified: r1 = value to print
-/// Returns: 0
-fn bpf_trace_printk(value: u64, _r2: u64, _r3: u64, _r4: u64, _r5: u64) -> u64 {
-    log::info!("[bpf_trace] value={}", value);
+/// If r1 is a pointer to NAME_BUFFER, prints as: "[trace] <name> count=<r2>"
+/// Otherwise prints: "[bpf_trace] r1=<r1> r2=<r2> r3=<r3>"
+fn bpf_trace_printk(r1: u64, r2: u64, r3: u64, _r4: u64, _r5: u64) -> u64 {
+    let name_range = get_name_buffer_range();
+
+    if r1 >= name_range.start && r1 < name_range.end {
+        // r1 is a pointer to name string in NAME_BUFFER
+        let name = unsafe {
+            let ptr = r1 as *const u8;
+            let mut len = 0;
+            while len < MAX_NAME_SIZE && *ptr.add(len) != 0 {
+                len += 1;
+            }
+            core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len))
+        };
+        log::info!("[trace] {} count={}", name, r2);
+    } else {
+        log::info!("[bpf_trace] r1={:#x} r2={:#x} r3={:#x}", r1, r2, r3);
+    }
     0
 }
 
@@ -94,6 +195,46 @@ fn bpf_trace_printk(value: u64, _r2: u64, _r3: u64, _r4: u64, _r5: u64) -> u64 {
 /// Returns: current CPU ID.
 fn bpf_get_smp_processor_id(_r1: u64, _r2: u64, _r3: u64, _r4: u64, _r5: u64) -> u64 {
     crate::platform::cpu_id() as u64
+}
+
+/// bpf_probe_read - safely read from kernel memory.
+///
+/// r1 = destination pointer
+/// r2 = size to read
+/// r3 = source pointer
+/// Returns: 0 on success, negative on error.
+///
+/// SAFETY: Assumes eBPF program is trusted and pointers are valid.
+fn bpf_probe_read(dst: u64, size: u64, src: u64, _r4: u64, _r5: u64) -> u64 {
+    if size == 0 || size > 4096 {
+        return (-1i64) as u64;
+    }
+
+    unsafe {
+        let src_ptr = src as *const u8;
+        let dst_ptr = dst as *mut u8;
+        core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, size as usize);
+    }
+
+    0
+}
+
+/// bpf_get_tracepoint_name - get tracepoint name by ID.
+///
+/// r1 = tracepoint_id
+/// Returns: pointer to null-terminated name string, or 0 if not found.
+fn bpf_get_tracepoint_name(id: u64, _r2: u64, _r3: u64, _r4: u64, _r5: u64) -> u64 {
+    use crate::tracepoints::registry;
+
+    let Some(name) = registry::get_name(id as u32) else {
+        return 0;
+    };
+
+    let mut buffer = NAME_BUFFER.lock();
+    let len = name.len().min(MAX_NAME_SIZE - 1);
+    buffer[..len].copy_from_slice(&name.as_bytes()[..len]);
+    buffer[len] = 0; // null terminate
+    buffer.as_ptr() as u64
 }
 
 // =============================================================================
@@ -112,9 +253,11 @@ pub fn get_helper(id: u32) -> Option<HelperFn> {
         id::MAP_LOOKUP_ELEM => Some(bpf_map_lookup_elem),
         id::MAP_UPDATE_ELEM => Some(bpf_map_update_elem),
         id::MAP_DELETE_ELEM => Some(bpf_map_delete_elem),
+        id::PROBE_READ => Some(bpf_probe_read),
         id::KTIME_GET_NS => Some(bpf_ktime_get_ns),
         id::TRACE_PRINTK => Some(bpf_trace_printk),
         id::GET_SMP_PROCESSOR_ID => Some(bpf_get_smp_processor_id),
+        id::GET_TRACEPOINT_NAME => Some(bpf_get_tracepoint_name),
         _ => None,
     }
 }
@@ -124,9 +267,11 @@ pub const SUPPORTED_HELPERS: &[u32] = &[
     id::MAP_LOOKUP_ELEM,
     id::MAP_UPDATE_ELEM,
     id::MAP_DELETE_ELEM,
+    id::PROBE_READ,
     id::KTIME_GET_NS,
     id::TRACE_PRINTK,
     id::GET_SMP_PROCESSOR_ID,
+    id::GET_TRACEPOINT_NAME,
 ];
 
 /// Register all standard helpers to an rbpf VM.

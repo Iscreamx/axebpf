@@ -142,6 +142,61 @@ pub fn map_count() -> usize {
     registry.iter().filter(|s| s.is_some()).count()
 }
 
+/// Get Map metadata (key_size, value_size) by FD.
+pub fn get_map_sizes(map_fd: u32) -> Option<(u32, u32)> {
+    let registry = MAP_REGISTRY.lock();
+    let map = registry.get(map_fd as usize)?.as_ref()?;
+    let meta = map.map_meta();
+    Some((meta.key_size, meta.value_size))
+}
+
+/// Iterate all keys in a map.
+///
+/// # Arguments
+/// * `map_fd` - Map ID returned by create().
+///
+/// # Returns
+/// Vector of key byte arrays.
+pub fn iter_map_keys(map_fd: u32) -> Vec<Vec<u8>> {
+    let mut keys = Vec::new();
+
+    // Get map metadata to know key size
+    let key_size = match get_map_sizes(map_fd) {
+        Some((ks, _)) => ks as usize,
+        None => return keys,
+    };
+
+    let mut registry = MAP_REGISTRY.lock();
+    let map = match registry.get_mut(map_fd as usize) {
+        Some(Some(m)) => m,
+        _ => return keys,
+    };
+
+    // Start with None to get first key
+    let mut current_key: Option<Vec<u8>> = None;
+    let mut next_key_buf = alloc::vec![0u8; key_size];
+
+    loop {
+        let result = match &current_key {
+            None => map.map_mut().get_next_key(None, &mut next_key_buf),
+            Some(key) => map
+                .map_mut()
+                .get_next_key(Some(key.as_slice()), &mut next_key_buf),
+        };
+
+        match result {
+            Ok(()) => {
+                let next_key = next_key_buf.clone();
+                keys.push(next_key.clone());
+                current_key = Some(next_key);
+            }
+            Err(_) => break,
+        }
+    }
+
+    keys
+}
+
 // =============================================================================
 // PerCpuVariantsOps Placeholder Implementation
 // =============================================================================

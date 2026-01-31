@@ -177,3 +177,28 @@ pub fn destroy(map_id: u32) -> Result<(), Error> {
     log::debug!("Destroyed map {}", map_id);
     Ok(())
 }
+
+/// Iterate all entries in a map.
+///
+/// # Arguments
+/// * `map_fd` - Map ID returned by create().
+///
+/// # Returns
+/// Vector of (key, value) byte pairs.
+pub fn iter_entries(map_fd: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
+    use crate::map_ops::iter_map_keys;
+
+    let mut entries = Vec::new();
+
+    // Iterate all keys
+    let keys = iter_map_keys(map_fd);
+
+    // Lookup value for each key
+    for key in keys {
+        if let Some(value) = lookup_elem(map_fd, &key) {
+            entries.push((key, value));
+        }
+    }
+
+    entries
+}
