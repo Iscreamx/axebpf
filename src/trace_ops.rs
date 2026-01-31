@@ -50,7 +50,7 @@ impl KernelTraceOps for AxKops {
         // For now, this is a no-op. Implementing code patching requires
         // architecture-specific memory protection manipulation.
         // TODO: Implement for x86_64 and aarch64
-        log::warn!(
+        log::debug!(
             "write_kernel_text called at {:p} with {} bytes (not implemented)",
             addr,
             data.len()

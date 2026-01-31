@@ -11,6 +11,7 @@ symbols = ["ksym"]
 tracepoint-support = ["symbols", "dep:tracepoint", "tp-lexer", "spin", "static-keys"]
 runtime = ["rbpf", "kbpf-basic", "spin"]
 axhal = ["dep:axhal"]
+precompiled-ebpf = []
 
 [dependencies]
 log = "0.4"

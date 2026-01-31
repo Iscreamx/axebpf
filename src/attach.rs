@@ -5,7 +5,25 @@
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
+
+/// Global verbose mode switch for real-time eBPF output
+static VERBOSE_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable verbose mode
+pub fn set_verbose(enabled: bool) {
+    VERBOSE_MODE.store(enabled, Ordering::SeqCst);
+    log::info!(
+        "eBPF verbose mode: {}",
+        if enabled { "enabled" } else { "disabled" }
+    );
+}
+
+/// Check if verbose mode is enabled
+pub fn is_verbose() -> bool {
+    VERBOSE_MODE.load(Ordering::SeqCst)
+}
 
 /// Error types for attachment operations.
 #[derive(Debug, Clone)]
@@ -35,18 +53,28 @@ impl core::fmt::Display for Error {
 
 impl core::error::Error for Error {}
 
-/// Global attachment registry: tracepoint name -> program ID
-static ATTACHMENTS: Mutex<BTreeMap<String, u32>> = Mutex::new(BTreeMap::new());
+/// Information about an attached program
+#[derive(Debug, Clone)]
+pub struct AttachmentInfo {
+    /// Program ID from runtime registry
+    pub prog_id: u32,
+    /// Program name (e.g., "printk", "stats")
+    pub prog_name: String,
+}
+
+/// Global attachment registry: tracepoint name -> attachment info
+static ATTACHMENTS: Mutex<BTreeMap<String, AttachmentInfo>> = Mutex::new(BTreeMap::new());
 
 /// Attach a program to a tracepoint.
 ///
 /// # Arguments
 /// * `tracepoint` - Tracepoint name in format "subsystem:event"
 /// * `prog_id` - Program ID from runtime::load_program()
+/// * `prog_name` - Program name for display purposes
 ///
 /// # Returns
 /// Ok(()) on success, Error if tracepoint already has attachment or program not found.
-pub fn attach(tracepoint: &str, prog_id: u32) -> Result<(), Error> {
+pub fn attach(tracepoint: &str, prog_id: u32, prog_name: &str) -> Result<(), Error> {
     // Verify program exists
     if crate::runtime::get_program(prog_id).is_none() {
         return Err(Error::ProgramNotFound(prog_id));
@@ -58,25 +86,38 @@ pub fn attach(tracepoint: &str, prog_id: u32) -> Result<(), Error> {
         return Err(Error::AlreadyAttached(tracepoint.to_string()));
     }
 
-    attachments.insert(tracepoint.to_string(), prog_id);
-    log::debug!("Attached program {} to {}", prog_id, tracepoint);
+    attachments.insert(
+        tracepoint.to_string(),
+        AttachmentInfo {
+            prog_id,
+            prog_name: prog_name.to_string(),
+        },
+    );
+    log::debug!(
+        "Attached program {} ({}) to {}",
+        prog_name,
+        prog_id,
+        tracepoint
+    );
     Ok(())
 }
 
 /// Detach a program from a tracepoint.
 ///
-/// # Arguments
-/// * `tracepoint` - Tracepoint name in format "subsystem:event"
-///
 /// # Returns
-/// The detached program ID on success.
-pub fn detach(tracepoint: &str) -> Result<u32, Error> {
+/// The detached attachment info on success.
+pub fn detach(tracepoint: &str) -> Result<AttachmentInfo, Error> {
     let mut attachments = ATTACHMENTS.lock();
 
     match attachments.remove(tracepoint) {
-        Some(prog_id) => {
-            log::debug!("Detached program {} from {}", prog_id, tracepoint);
-            Ok(prog_id)
+        Some(info) => {
+            log::debug!(
+                "Detached program {} ({}) from {}",
+                info.prog_name,
+                info.prog_id,
+                tracepoint
+            );
+            Ok(info)
         }
         None => Err(Error::NotAttached(tracepoint.to_string())),
     }
@@ -84,23 +125,23 @@ pub fn detach(tracepoint: &str) -> Result<u32, Error> {
 
 /// Get the program attached to a tracepoint.
 ///
-/// # Arguments
-/// * `tracepoint` - Tracepoint name in format "subsystem:event"
-///
 /// # Returns
-/// Some(prog_id) if attached, None otherwise.
-pub fn get_attached(tracepoint: &str) -> Option<u32> {
+/// Some(AttachmentInfo) if attached, None otherwise.
+pub fn get_attached(tracepoint: &str) -> Option<AttachmentInfo> {
     let attachments = ATTACHMENTS.lock();
-    attachments.get(tracepoint).copied()
+    attachments.get(tracepoint).cloned()
 }
 
 /// List all attachments.
 ///
 /// # Returns
-/// Vector of (tracepoint_name, program_id) pairs.
-pub fn list_attachments() -> Vec<(String, u32)> {
+/// Vector of (tracepoint_name, AttachmentInfo) pairs.
+pub fn list_attachments() -> Vec<(String, AttachmentInfo)> {
     let attachments = ATTACHMENTS.lock();
-    attachments.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    attachments
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 /// Get count of attachments.

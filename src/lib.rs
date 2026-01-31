@@ -87,12 +87,33 @@ pub mod runtime;
 #[cfg(feature = "runtime")]
 pub mod attach;
 
-// Re-export key types for convenience
 #[cfg(feature = "runtime")]
-pub use maps::{Error as MapError, MapDef, MapType};
+pub mod context;
 
 #[cfg(feature = "runtime")]
-pub use runtime::{EbpfProgram, Error as RuntimeError};
+pub mod programs;
+
+#[cfg(feature = "runtime")]
+pub mod output;
+
+// Re-export key types for convenience
+#[cfg(feature = "runtime")]
+pub use maps::{Error as MapError, MapDef, MapType, iter_entries};
+
+#[cfg(feature = "runtime")]
+pub use runtime::{EbpfProgram, Error as RuntimeError, get_program_map_fds};
+
+#[cfg(feature = "runtime")]
+pub use context::TraceContext;
+
+#[cfg(feature = "runtime")]
+pub use programs::{PrecompiledProgram, ProgramRegistry};
+
+#[cfg(feature = "runtime")]
+pub use attach::{AttachmentInfo, is_verbose, set_verbose};
+
+#[cfg(feature = "runtime")]
+pub use output::{print_ebpf_result, print_if_verbose};
 
 // =============================================================================
 // Initialization
