@@ -31,7 +31,7 @@ static-keys = { version = "0.8.2", default-features = false, optional = true }
 
 # runtime feature
 rbpf = { git = "https://github.com/qmonnet/rbpf", default-features = false, optional = true }
-kbpf-basic = { git = "https://github.com/Iscreamx/kbpf-basic.git", optional = true }
+kbpf-basic = { git = "https://github.com/Starry-OS/kbpf-basic.git", optional = true }
 
 [dev-dependencies]
 # For testing in user space (no kernel dependencies needed)
