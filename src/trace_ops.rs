@@ -47,13 +47,9 @@ impl KernelTraceOps for AxKops {
     }
 
     fn write_kernel_text(addr: *mut core::ffi::c_void, data: &[u8]) {
-        // For now, this is a no-op. Implementing code patching requires
-        // architecture-specific memory protection manipulation.
-        // TODO: Implement for x86_64 and aarch64
-        log::debug!(
-            "write_kernel_text called at {:p} with {} bytes (not implemented)",
-            addr,
-            data.len()
-        );
+        let addr = addr as usize;
+        if !crate::page_table::write_kernel_text(addr, data) {
+            log::error!("write_kernel_text failed at {:#x}", addr);
+        }
     }
 }
