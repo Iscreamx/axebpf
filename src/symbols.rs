@@ -96,3 +96,38 @@ pub fn lookup_addr(name: &str) -> Option<u64> {
     let table = unsafe { (*table_ptr).as_ref() }?;
     table.lookup_name(name)
 }
+
+/// Search for symbols containing a pattern.
+///
+/// Returns a vector of (name, address) tuples for matching symbols.
+/// Limited to max_results to avoid excessive output.
+pub fn search_symbols(pattern: &str, max_results: usize) -> alloc::vec::Vec<(String, u64)> {
+    use alloc::vec::Vec;
+
+    let table_ptr = SYMBOL_TABLE.0.get();
+    let table = match unsafe { (*table_ptr).as_ref() } {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    let all = table.dump_all_symbols();
+    let mut results = Vec::new();
+
+    for line in all.lines() {
+        if results.len() >= max_results {
+            break;
+        }
+        // Format: "0000000000000000 T symbol_name"
+        let parts: Vec<&str> = line.splitn(3, ' ').collect();
+        if parts.len() >= 3 {
+            let name = parts[2];
+            if name.contains(pattern) {
+                if let Ok(addr) = u64::from_str_radix(parts[0], 16) {
+                    results.push((String::from(name), addr));
+                }
+            }
+        }
+    }
+
+    results
+}
