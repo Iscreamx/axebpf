@@ -25,8 +25,9 @@ const KPROBES_BRK_SS_IMM: u64 = 0x006;   // Single-step complete (BRK #6)
 /// * `pc` - The program counter where breakpoint was hit (ELR_EL2)
 /// * `iss` - Instruction Specific Syndrome (contains BRK immediate value)
 /// * `spsr` - Mutable reference to saved program status register
+/// * `regs` - Raw pointer and size of the TrapFrame for eBPF context
 /// * `set_pc` - Callback to set new PC value
-pub fn handle_breakpoint<F>(pc: usize, iss: u64, spsr: &mut u64, set_pc: F) -> bool
+pub fn handle_breakpoint<F>(pc: usize, iss: u64, spsr: &mut u64, regs: Option<(*mut u8, usize)>, set_pc: F) -> bool
 where
     F: FnOnce(usize),
 {
@@ -35,7 +36,7 @@ where
     match iss {
         KPROBES_BRK_IMM => {
             // Main breakpoint (BRK #4) - hit at probe address
-            handle_main_breakpoint(pc, set_pc)
+            handle_main_breakpoint(pc, regs, set_pc)
         }
         KPROBES_BRK_SS_IMM => {
             // Single-step complete (BRK #6) - hit after executing original instruction
@@ -50,7 +51,7 @@ where
 
 /// Handle the main breakpoint (BRK #4) at the probe address.
 /// This is triggered when execution reaches the probed function.
-fn handle_main_breakpoint<F>(pc: usize, set_pc: F) -> bool
+fn handle_main_breakpoint<F>(pc: usize, regs: Option<(*mut u8, usize)>, set_pc: F) -> bool
 where
     F: FnOnce(usize),
 {
@@ -76,6 +77,21 @@ where
     // Record the hit
     kprobe_manager::record_hit(pc);
     log::info!("kprobe_handler: recorded hit at {:#x}", pc);
+
+    // Execute the attached eBPF program
+    if let Some(prog_id) = kprobe_manager::lookup_prog_id(pc) {
+        log::info!("kprobe_handler: executing eBPF program {} for {:#x}", prog_id, pc);
+
+        // Use the TrapFrame as context if available
+        if let Some((regs_ptr, regs_size)) = regs {
+            let ctx = unsafe { core::slice::from_raw_parts_mut(regs_ptr, regs_size) };
+            if let Err(e) = crate::runtime::run_program(prog_id, Some(ctx)) {
+                log::warn!("kprobe_handler: eBPF program {} failed: {:?}", prog_id, e);
+            }
+        } else {
+            log::warn!("kprobe_handler: no TrapFrame context available for eBPF program");
+        }
+    }
 
     // Save original PC for return after single-step
     save_original_pc(pc);
