@@ -39,6 +39,30 @@ impl ProgramRegistry {
             });
         }
 
+        if !bytecode::KPROBE_ARGS.is_empty() {
+            programs.push(PrecompiledProgram {
+                name: "kprobe_args",
+                description: "Kprobe argument tracer (captures x0-x3)",
+                bytecode: bytecode::KPROBE_ARGS,
+            });
+        }
+
+        if !bytecode::KPROBE_SIMPLE.is_empty() {
+            programs.push(PrecompiledProgram {
+                name: "kprobe_simple",
+                description: "Simple kprobe tracer (captures x0 only)",
+                bytecode: bytecode::KPROBE_SIMPLE,
+            });
+        }
+
+        if !bytecode::KPROBE_NOOP.is_empty() {
+            programs.push(PrecompiledProgram {
+                name: "kprobe_noop",
+                description: "Minimal noop kprobe (just returns 1)",
+                bytecode: bytecode::KPROBE_NOOP,
+            });
+        }
+
         programs
     }
 
@@ -55,12 +79,27 @@ impl ProgramRegistry {
                 description: "Debug logger (prints tracepoint name and count)",
                 bytecode: bytecode::PRINTK,
             }),
+            "kprobe_args" if !bytecode::KPROBE_ARGS.is_empty() => Some(PrecompiledProgram {
+                name: "kprobe_args",
+                description: "Kprobe argument tracer (captures x0-x3)",
+                bytecode: bytecode::KPROBE_ARGS,
+            }),
+            "kprobe_simple" if !bytecode::KPROBE_SIMPLE.is_empty() => Some(PrecompiledProgram {
+                name: "kprobe_simple",
+                description: "Simple kprobe tracer (captures x0 only)",
+                bytecode: bytecode::KPROBE_SIMPLE,
+            }),
+            "kprobe_noop" if !bytecode::KPROBE_NOOP.is_empty() => Some(PrecompiledProgram {
+                name: "kprobe_noop",
+                description: "Minimal noop kprobe (just returns 1)",
+                bytecode: bytecode::KPROBE_NOOP,
+            }),
             _ => None,
         }
     }
 
     /// Check if any pre-compiled programs are available
     pub fn is_available() -> bool {
-        !bytecode::STATS.is_empty() || !bytecode::PRINTK.is_empty()
+        !bytecode::STATS.is_empty() || !bytecode::PRINTK.is_empty() || !bytecode::KPROBE_ARGS.is_empty()
     }
 }
