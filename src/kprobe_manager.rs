@@ -36,6 +36,8 @@ pub struct KprobeEntry {
     pub state: KprobeState,
     /// Is this a kretprobe?
     pub is_ret: bool,
+    /// Associated eBPF program ID
+    pub prog_id: u32,
 }
 
 /// Global kprobe registry
@@ -65,7 +67,7 @@ impl KprobeRegistry {
     }
 
     /// Register a kprobe by symbol name.
-    pub fn register(&mut self, name: &str, is_ret: bool) -> Result<usize, &'static str> {
+    pub fn register(&mut self, name: &str, prog_id: u32, is_ret: bool) -> Result<usize, &'static str> {
         // Look up symbol address
         let addr = symbols::lookup_addr(name).ok_or("symbol not found")? as usize;
 
@@ -74,8 +76,8 @@ impl KprobeRegistry {
         }
 
         log::info!(
-            "kprobe: registering {} at {:#x} (is_ret={})",
-            name, addr, is_ret
+            "kprobe: registering {} at {:#x} (is_ret={}, prog_id={})",
+            name, addr, is_ret, prog_id
         );
 
         let entry = KprobeEntry {
@@ -84,6 +86,7 @@ impl KprobeRegistry {
             hits: 0,
             state: KprobeState::Disabled,
             is_ret,
+            prog_id,
         };
 
         self.probes.insert(addr, entry);
@@ -201,32 +204,104 @@ impl KprobeRegistry {
     }
 }
 
-/// Pre-handler callback for kprobes
-fn kprobe_pre_handler(_data: &dyn kprobe::ProbeData, _pt_regs: &mut kprobe::PtRegs) {
-    // Note: break_address is private in the kprobe crate, so we can't get the address here.
-    // The hit counting is done via the probe point mechanism instead.
-    log::debug!("kprobe: pre_handler triggered");
+/// Pre-handler callback for kprobes - executes associated eBPF program
+fn kprobe_pre_handler(_data: &dyn kprobe::ProbeData, pt_regs: &mut kprobe::PtRegs) {
+    #[cfg(target_arch = "aarch64")]
+    let addr = pt_regs.pc as usize;
+    #[cfg(target_arch = "x86_64")]
+    let addr = pt_regs.rip as usize;
+
+    // Look up associated eBPF program
+    let prog_id = match lookup_prog_id(addr) {
+        Some(id) => id,
+        None => {
+            log::debug!("kprobe: no eBPF program for {:#x}", addr);
+            return;
+        }
+    };
+
+    // Pass pt_regs directly to eBPF (zero-copy, aya compatible)
+    #[cfg(feature = "runtime")]
+    {
+        let ctx_bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                pt_regs as *mut kprobe::PtRegs as *mut u8,
+                core::mem::size_of::<kprobe::PtRegs>(),
+            )
+        };
+        if let Err(e) = crate::runtime::run_program(prog_id, Some(ctx_bytes)) {
+            log::warn!("kprobe: eBPF execution failed at {:#x}: {:?}", addr, e);
+        }
+    }
+
+    #[cfg(not(feature = "runtime"))]
+    {
+        log::debug!("kprobe: runtime not enabled, skipping eBPF execution for prog {}", prog_id);
+    }
+
+    // Record hit
+    record_hit(addr);
 }
 
-/// Post-handler callback for kretprobes
-fn kprobe_post_handler(_data: &dyn kprobe::ProbeData, _pt_regs: &mut kprobe::PtRegs) {
-    log::debug!("kprobe: post_handler triggered");
+/// Post-handler callback for kretprobes - executes associated eBPF program
+fn kprobe_post_handler(_data: &dyn kprobe::ProbeData, pt_regs: &mut kprobe::PtRegs) {
+    #[cfg(target_arch = "aarch64")]
+    let addr = pt_regs.pc as usize;
+    #[cfg(target_arch = "x86_64")]
+    let addr = pt_regs.rip as usize;
+
+    // Look up associated eBPF program
+    let prog_id = match lookup_prog_id(addr) {
+        Some(id) => id,
+        None => {
+            log::debug!("kretprobe: no eBPF program for {:#x}", addr);
+            return;
+        }
+    };
+
+    // Pass pt_regs directly to eBPF (zero-copy, aya compatible)
+    #[cfg(feature = "runtime")]
+    {
+        let ctx_bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                pt_regs as *mut kprobe::PtRegs as *mut u8,
+                core::mem::size_of::<kprobe::PtRegs>(),
+            )
+        };
+        if let Err(e) = crate::runtime::run_program(prog_id, Some(ctx_bytes)) {
+            log::warn!("kretprobe: eBPF execution failed at {:#x}: {:?}", addr, e);
+        }
+    }
+
+    #[cfg(not(feature = "runtime"))]
+    {
+        log::debug!("kretprobe: runtime not enabled, skipping eBPF execution for prog {}", prog_id);
+    }
 }
 
 /// Initialize the kprobe subsystem.
 pub fn init() {
+    static INITIALIZED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    if INITIALIZED.swap(true, core::sync::atomic::Ordering::SeqCst) {
+        return; // Already initialized
+    }
+
     let mut registry = KPROBE_REGISTRY.lock();
     if registry.is_none() {
         *registry = Some(KprobeRegistry::new());
-        log::info!("kprobe: subsystem initialized");
     }
+    drop(registry);
+
+    log::info!("kprobe: subsystem initialized");
 }
 
 /// Register a kprobe by symbol name.
-pub fn register(name: &str, is_ret: bool) -> Result<usize, &'static str> {
+pub fn register(name: &str, prog_id: u32, is_ret: bool) -> Result<usize, &'static str> {
     let mut registry = KPROBE_REGISTRY.lock();
     let registry = registry.as_mut().ok_or("kprobe subsystem not initialized")?;
-    registry.register(name, is_ret)
+    registry.register(name, prog_id, is_ret)
 }
 
 /// Enable a kprobe.
@@ -256,6 +331,20 @@ pub fn lookup(addr: usize) -> Option<bool> {
     registry.as_ref().and_then(|r| r.get(addr).map(|e| e.state == KprobeState::Enabled))
 }
 
+/// Look up the eBPF program ID for a kprobe by address.
+pub fn lookup_prog_id(addr: usize) -> Option<u32> {
+    let registry = KPROBE_REGISTRY.lock();
+    registry.as_ref().and_then(|r| {
+        r.get(addr).and_then(|e| {
+            if e.state == KprobeState::Enabled {
+                Some(e.prog_id)
+            } else {
+                None
+            }
+        })
+    })
+}
+
 /// Record a kprobe hit.
 pub fn record_hit(addr: usize) {
     let mut registry = KPROBE_REGISTRY.lock();
@@ -265,19 +354,19 @@ pub fn record_hit(addr: usize) {
 }
 
 /// List all kprobes for shell command.
-pub fn list_all() -> Vec<(String, usize, u64, bool, bool)> {
+pub fn list_all() -> Vec<(String, usize, u64, bool, bool, u32)> {
     let registry = KPROBE_REGISTRY.lock();
     match registry.as_ref() {
         Some(r) => r.list().iter().map(|e| {
-            (e.name.clone(), e.addr, e.hits, e.state == KprobeState::Enabled, e.is_ret)
+            (e.name.clone(), e.addr, e.hits, e.state == KprobeState::Enabled, e.is_ret, e.prog_id)
         }).collect(),
         None => Vec::new(),
     }
 }
 
 /// Register and enable a kprobe by name.
-pub fn attach(name: &str, is_ret: bool) -> Result<usize, &'static str> {
-    let addr = register(name, is_ret)?;
+pub fn attach(name: &str, prog_id: u32, is_ret: bool) -> Result<usize, &'static str> {
+    let addr = register(name, prog_id, is_ret)?;
     enable(addr)?;
     Ok(addr)
 }
