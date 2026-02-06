@@ -105,6 +105,38 @@ pub fn cpu_id() -> u32 {
     Platform::cpu_id()
 }
 
+/// Get current VM ID.
+///
+/// Returns 0 when in host context (not handling a VM).
+/// In kernel environment, this should query the VMM's current VM state.
+#[cfg(not(test))]
+pub fn current_vm_id() -> u32 {
+    // TODO: Integrate with axvisor's VM tracking
+    // For now, return 0 (host context)
+    0
+}
+
+#[cfg(test)]
+pub fn current_vm_id() -> u32 {
+    0
+}
+
+/// Get current vCPU ID.
+///
+/// Returns 0 when not in vCPU context.
+/// In kernel environment, this should query the VMM's current vCPU state.
+#[cfg(not(test))]
+pub fn current_vcpu_id() -> u32 {
+    // TODO: Integrate with axvisor's vCPU tracking
+    // For now, return 0 (not in vCPU context)
+    0
+}
+
+#[cfg(test)]
+pub fn current_vcpu_id() -> u32 {
+    0
+}
+
 // =============================================================================
 // Tests
 // =============================================================================

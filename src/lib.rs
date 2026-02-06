@@ -133,6 +133,9 @@ pub use attach::{AttachmentInfo, is_verbose, set_verbose};
 #[cfg(feature = "runtime")]
 pub use output::{print_ebpf_result, print_if_verbose};
 
+#[cfg(feature = "kprobe")]
+pub use kprobe::PtRegs;
+
 // =============================================================================
 // Initialization
 // =============================================================================
