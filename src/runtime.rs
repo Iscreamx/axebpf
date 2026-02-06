@@ -302,11 +302,17 @@ fn parse_elf_with_maps(elf_data: &[u8]) -> Result<ElfParseResult, Error> {
         );
 
         // Identify sections
-        if section_name == "tracepoint" || section_name.starts_with("tracepoint/") {
+        if section_name == "tracepoint" || section_name.starts_with("tracepoint/")
+            || section_name == "kprobe" || section_name.starts_with("kprobe/")
+            || section_name == "kretprobe" || section_name.starts_with("kretprobe/")
+        {
             code_section = Some((i, sh_offset, sh_size));
         } else if section_name == "maps" {
             maps_section = Some((i, sh_offset, sh_size));
-        } else if section_name == ".reltracepoint" || section_name.starts_with(".reltracepoint") {
+        } else if section_name == ".reltracepoint" || section_name.starts_with(".reltracepoint")
+            || section_name == ".relkprobe" || section_name.starts_with(".relkprobe")
+            || section_name == ".relkretprobe" || section_name.starts_with(".relkretprobe")
+        {
             rel_section = Some((sh_offset, sh_size));
         } else if sh_type == 2 {
             // SHT_SYMTAB

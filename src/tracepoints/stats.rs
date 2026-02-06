@@ -12,8 +12,11 @@ use super::registry;
 ///
 /// Called by tracepoint trigger functions to run attached eBPF programs.
 pub fn execute_attached_program(tracepoint_name: &str, timestamp: u64, duration_ns: u64) {
+    log::debug!("execute_attached_program called for '{}'", tracepoint_name);
+
     // Check if there is an attached program
     if let Some(info) = attach::get_attached(tracepoint_name) {
+        log::info!("Found attached program '{}' (id={}) for '{}'", info.prog_name, info.prog_id, tracepoint_name);
         // Get tracepoint ID from registry
         let tp_id = registry::get_id(tracepoint_name).unwrap_or(0);
 
