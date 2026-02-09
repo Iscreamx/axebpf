@@ -2,8 +2,7 @@
 //!
 //! Provides VM for running eBPF programs with registered helpers.
 
-use alloc::collections::BTreeMap;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
@@ -45,34 +44,6 @@ impl core::fmt::Display for Error {
 
 impl core::error::Error for Error {}
 
-// =============================================================================
-// ELF Map Relocation Structures
-// =============================================================================
-
-/// Map definition extracted from ELF `maps` section.
-#[derive(Debug, Clone)]
-struct ElfMapDef {
-    /// Symbol name (e.g., "COUNTER_MAP")
-    name: String,
-    /// BPF_MAP_TYPE_* value
-    map_type: u32,
-    /// Size of key in bytes
-    key_size: u32,
-    /// Size of value in bytes
-    value_size: u32,
-    /// Maximum number of entries
-    max_entries: u32,
-}
-
-/// Relocation entry from ELF `.relXXX` section.
-#[derive(Debug, Clone)]
-struct ElfReloc {
-    /// Offset in code section where patch is needed
-    offset: usize,
-    /// Symbol index in symbol table
-    symbol_idx: usize,
-}
-
 /// Result of parsing ELF with Maps.
 #[derive(Debug)]
 struct ElfParseResult {
@@ -83,7 +54,7 @@ struct ElfParseResult {
 }
 
 // =============================================================================
-// ELF Parsing (minimal implementation for eBPF)
+// ELF Parsing (aya-obj based)
 // =============================================================================
 
 /// ELF magic number
@@ -94,360 +65,89 @@ fn is_elf(data: &[u8]) -> bool {
     data.len() >= 4 && data[0..4] == ELF_MAGIC
 }
 
-/// Parse the `maps` section to extract Map definitions.
+/// Parse ELF file using aya-obj with full relocation support.
 ///
-/// Each Map definition is 28 bytes:
-/// - offset 0x00: map_type (u32)
-/// - offset 0x04: key_size (u32)
-/// - offset 0x08: value_size (u32)
-/// - offset 0x0c: max_entries (u32)
-/// - offset 0x10: map_flags (u32) - ignored
-/// - offset 0x14-0x1b: padding
-fn parse_maps_section(
-    maps_data: &[u8],
-    symbols: &[(String, usize, usize)], // (name, section_idx, offset)
-    maps_section_idx: usize,
-) -> Vec<ElfMapDef> {
-    const MAP_DEF_SIZE: usize = 28;
-    let mut map_defs = Vec::new();
-
-    // Find symbols that point to maps section
-    for (name, sec_idx, offset) in symbols {
-        if *sec_idx != maps_section_idx {
-            continue;
-        }
-
-        // Ensure offset is valid
-        if *offset + MAP_DEF_SIZE > maps_data.len() {
-            log::warn!("Map '{}' offset {} exceeds maps section size", name, offset);
-            continue;
-        }
-
-        let base = *offset;
-        let map_type = u32::from_le_bytes(maps_data[base..base + 4].try_into().unwrap());
-        let key_size = u32::from_le_bytes(maps_data[base + 4..base + 8].try_into().unwrap());
-        let value_size = u32::from_le_bytes(maps_data[base + 8..base + 12].try_into().unwrap());
-        let max_entries = u32::from_le_bytes(maps_data[base + 12..base + 16].try_into().unwrap());
-
-        log::debug!(
-            "Found map '{}': type={}, key_size={}, value_size={}, max_entries={}",
-            name,
-            map_type,
-            key_size,
-            value_size,
-            max_entries
-        );
-
-        map_defs.push(ElfMapDef {
-            name: name.clone(),
-            map_type,
-            key_size,
-            value_size,
-            max_entries,
-        });
-    }
-
-    map_defs
-}
-
-/// Parse a relocation section (.relXXX).
-///
-/// Each relocation entry is 16 bytes (REL format for BPF):
-/// - offset 0x00: r_offset (u64) - offset in target section
-/// - offset 0x08: r_info (u64) - symbol index in upper 32 bits
-fn parse_relocation_section(rel_data: &[u8]) -> Vec<ElfReloc> {
-    const REL_ENTRY_SIZE: usize = 16;
-    let mut relocs = Vec::new();
-
-    let num_entries = rel_data.len() / REL_ENTRY_SIZE;
-    for i in 0..num_entries {
-        let base = i * REL_ENTRY_SIZE;
-        if base + REL_ENTRY_SIZE > rel_data.len() {
-            break;
-        }
-
-        let r_offset = u64::from_le_bytes(rel_data[base..base + 8].try_into().unwrap()) as usize;
-        let r_info = u64::from_le_bytes(rel_data[base + 8..base + 16].try_into().unwrap());
-
-        // Symbol index is in upper 32 bits of r_info
-        let symbol_idx = (r_info >> 32) as usize;
-
-        log::debug!(
-            "Relocation: offset={:#x}, symbol_idx={}",
-            r_offset,
-            symbol_idx
-        );
-
-        relocs.push(ElfReloc {
-            offset: r_offset,
-            symbol_idx,
-        });
-    }
-
-    relocs
-}
-
-/// Patch a `ld_map_fd` instruction with actual Map FD.
-///
-/// The `ld_map_fd` is a 16-byte double instruction (ld_imm64):
-/// - Instruction 1: opcode=0x18, imm=fd_lo (bytes 4-7)
-/// - Instruction 2: pseudo, imm=fd_hi (bytes 12-15)
-fn patch_map_fd(bytecode: &mut [u8], offset: usize, map_fd: u32) -> Result<(), Error> {
-    // Verify bounds
-    if offset + 16 > bytecode.len() {
-        log::warn!(
-            "Relocation offset {:#x} exceeds bytecode length {}",
-            offset,
-            bytecode.len()
-        );
-        return Err(Error::RelocationFailed);
-    }
-
-    // Verify this is a ld_imm64 instruction (opcode 0x18)
-    if bytecode[offset] != 0x18 {
-        log::warn!(
-            "Expected ld_imm64 (0x18) at offset {:#x}, found {:#x}",
-            offset,
-            bytecode[offset]
-        );
-        return Err(Error::InvalidProgram);
-    }
-
-    // Patch imm_lo (bytes 4-7 of first instruction)
-    bytecode[offset + 4..offset + 8].copy_from_slice(&map_fd.to_le_bytes());
-
-    // Patch imm_hi (bytes 12-15 of second instruction) - always 0 for 32-bit FDs
-    bytecode[offset + 12..offset + 16].copy_from_slice(&0u32.to_le_bytes());
-
-    log::debug!("Patched Map FD {} at offset {:#x}", map_fd, offset);
-    Ok(())
-}
-
-/// Parse ELF file with full Map relocation support.
-///
-/// This function:
-/// 1. Parses section headers to find maps, code, and relocation sections
-/// 2. Parses symbol table to get Map names
-/// 3. Creates Maps and gets FDs
-/// 4. Patches bytecode with Map FDs
-fn parse_elf_with_maps(elf_data: &[u8]) -> Result<ElfParseResult, Error> {
-    if elf_data.len() < 64 {
-        return Err(Error::ElfParseError);
-    }
+/// Handles:
+/// - `.text` section merging (memcpy/memmove/memset)
+/// - `R_BPF_64_64` map fd relocations
+/// - `R_BPF_64_32` function call relocations (BPF-to-BPF)
+/// - BTF-defined and legacy map sections
+fn parse_elf_with_aya(
+    elf_data: &[u8],
+    prog_name: Option<&str>,
+) -> Result<ElfParseResult, Error> {
+    use aya_obj::Object;
+    use hashbrown::HashSet;
 
     log::debug!(
-        "Parsing ELF with Map support, size={} bytes",
-        elf_data.len()
+        "Parsing ELF with aya-obj, size={} bytes, prog_name={:?}",
+        elf_data.len(),
+        prog_name
     );
 
-    // ELF64 header parsing
-    let e_shoff = u64::from_le_bytes(elf_data[40..48].try_into().unwrap()) as usize;
-    let e_shentsize = u16::from_le_bytes(elf_data[58..60].try_into().unwrap()) as usize;
-    let e_shnum = u16::from_le_bytes(elf_data[60..62].try_into().unwrap()) as usize;
-    let e_shstrndx = u16::from_le_bytes(elf_data[62..64].try_into().unwrap()) as usize;
+    // Phase 1: Parse ELF
+    //
+    // The `object` crate's ELF parser requires the input buffer to be aligned
+    // to `align_of::<FileHeader64>()` (8 bytes on aarch64). Data from
+    // `include_bytes!()` is placed in .rodata with no alignment guarantee,
+    // so we must copy to an aligned buffer when the pointer is misaligned.
+    let aligned_buf;
+    let parse_data = if (elf_data.as_ptr() as usize) % 8 != 0 {
+        log::debug!("ELF data not 8-byte aligned (ptr={:#x}), copying to aligned buffer", elf_data.as_ptr() as usize);
+        aligned_buf = elf_data.to_vec();
+        aligned_buf.as_slice()
+    } else {
+        elf_data
+    };
 
-    if e_shoff == 0 || e_shnum == 0 {
-        return Err(Error::ElfParseError);
-    }
-
-    // Get section name string table offset
-    let shstrtab_off = e_shoff + e_shstrndx * e_shentsize;
-    if shstrtab_off + e_shentsize > elf_data.len() {
-        return Err(Error::ElfParseError);
-    }
-    let strtab_sh_offset = u64::from_le_bytes(
-        elf_data[shstrtab_off + 24..shstrtab_off + 32]
-            .try_into()
-            .unwrap(),
-    ) as usize;
-
-    // First pass: collect section info
-    let mut code_section: Option<(usize, usize, usize)> = None; // (idx, offset, size)
-    let mut maps_section: Option<(usize, usize, usize)> = None;
-    let mut rel_section: Option<(usize, usize)> = None; // (offset, size)
-    let mut symtab_section: Option<(usize, usize, usize)> = None; // (offset, size, link)
-    let mut _strtab_offset: usize = 0;
-
-    for i in 0..e_shnum {
-        let sh_off = e_shoff + i * e_shentsize;
-        if sh_off + e_shentsize > elf_data.len() {
-            continue;
-        }
-
-        let sh_name_off =
-            u32::from_le_bytes(elf_data[sh_off..sh_off + 4].try_into().unwrap()) as usize;
-        let sh_type = u32::from_le_bytes(elf_data[sh_off + 4..sh_off + 8].try_into().unwrap());
-        let sh_offset =
-            u64::from_le_bytes(elf_data[sh_off + 24..sh_off + 32].try_into().unwrap()) as usize;
-        let sh_size =
-            u64::from_le_bytes(elf_data[sh_off + 32..sh_off + 40].try_into().unwrap()) as usize;
-        let sh_link =
-            u32::from_le_bytes(elf_data[sh_off + 40..sh_off + 44].try_into().unwrap()) as usize;
-
-        // Get section name
-        let name_start = strtab_sh_offset + sh_name_off;
-        let mut name_end = name_start;
-        while name_end < elf_data.len() && elf_data[name_end] != 0 {
-            name_end += 1;
-        }
-        let section_name = core::str::from_utf8(&elf_data[name_start..name_end]).unwrap_or("");
-
-        log::debug!(
-            "Section [{}] '{}': type={}, offset={:#x}, size={}",
-            i,
-            section_name,
-            sh_type,
-            sh_offset,
-            sh_size
-        );
-
-        // Identify sections
-        if section_name == "tracepoint" || section_name.starts_with("tracepoint/")
-            || section_name == "kprobe" || section_name.starts_with("kprobe/")
-            || section_name == "kretprobe" || section_name.starts_with("kretprobe/")
-        {
-            code_section = Some((i, sh_offset, sh_size));
-        } else if section_name == "maps" {
-            maps_section = Some((i, sh_offset, sh_size));
-        } else if section_name == ".reltracepoint" || section_name.starts_with(".reltracepoint")
-            || section_name == ".relkprobe" || section_name.starts_with(".relkprobe")
-            || section_name == ".relkretprobe" || section_name.starts_with(".relkretprobe")
-        {
-            rel_section = Some((sh_offset, sh_size));
-        } else if sh_type == 2 {
-            // SHT_SYMTAB
-            symtab_section = Some((sh_offset, sh_size, sh_link));
-        } else if sh_type == 3 && section_name == ".strtab" {
-            // SHT_STRTAB
-            _strtab_offset = sh_offset;
-        }
-    }
-
-    // Must have code section
-    let (_code_idx, code_offset, code_size) = code_section.ok_or_else(|| {
-        log::warn!("No tracepoint code section found");
+    let mut obj = Object::parse(parse_data).map_err(|e| {
+        log::warn!("aya-obj ELF parse error: {e:?}");
         Error::ElfParseError
     })?;
 
-    // Extract bytecode
-    if code_offset + code_size > elf_data.len() {
-        return Err(Error::ElfParseError);
-    }
-    let mut bytecode = elf_data[code_offset..code_offset + code_size].to_vec();
+    log::debug!(
+        "Parsed ELF: {} programs, {} maps, {} functions",
+        obj.programs.len(),
+        obj.maps.len(),
+        obj.functions.len()
+    );
 
-    // If no maps section, return bytecode as-is (backward compatible)
-    let (maps_idx, maps_offset, maps_size) = match maps_section {
-        Some(m) => m,
-        None => {
-            log::debug!("No maps section, returning raw bytecode");
-            return Ok(ElfParseResult {
-                bytecode,
-                map_fds: Vec::new(),
-            });
-        }
-    };
-
-    // Parse symbol table to get Map names
-    let (sym_offset, sym_size, sym_strtab_link) = symtab_section.ok_or_else(|| {
-        log::warn!("No symbol table found");
-        Error::ElfParseError
-    })?;
-
-    // Get symbol string table offset (from link field)
-    let sym_strtab_off = {
-        let link_sh_off = e_shoff + sym_strtab_link * e_shentsize;
-        if link_sh_off + e_shentsize > elf_data.len() {
-            _strtab_offset
-        } else {
-            u64::from_le_bytes(
-                elf_data[link_sh_off + 24..link_sh_off + 32]
-                    .try_into()
-                    .unwrap(),
-            ) as usize
-        }
-    };
-
-    // Parse symbols: (name, section_idx, value/offset)
-    let mut symbols: Vec<(String, usize, usize)> = Vec::new();
-    const SYM_ENTRY_SIZE: usize = 24; // ELF64 symbol entry size
-    let num_symbols = sym_size / SYM_ENTRY_SIZE;
-
-    for i in 0..num_symbols {
-        let base = sym_offset + i * SYM_ENTRY_SIZE;
-        if base + SYM_ENTRY_SIZE > elf_data.len() {
-            break;
-        }
-
-        let st_name = u32::from_le_bytes(elf_data[base..base + 4].try_into().unwrap()) as usize;
-        let st_shndx =
-            u16::from_le_bytes(elf_data[base + 6..base + 8].try_into().unwrap()) as usize;
-        let st_value =
-            u64::from_le_bytes(elf_data[base + 8..base + 16].try_into().unwrap()) as usize;
-
-        // Get symbol name
-        let name_start = sym_strtab_off + st_name;
-        let mut name_end = name_start;
-        while name_end < elf_data.len() && elf_data[name_end] != 0 {
-            name_end += 1;
-        }
-        let sym_name = core::str::from_utf8(&elf_data[name_start..name_end])
-            .unwrap_or("")
-            .to_string();
-
-        if !sym_name.is_empty() {
-            symbols.push((sym_name, st_shndx, st_value));
-        }
-    }
-
-    // Parse maps section
-    let maps_data = &elf_data[maps_offset..maps_offset + maps_size];
-    let map_defs = parse_maps_section(maps_data, &symbols, maps_idx);
-
-    if map_defs.is_empty() {
-        log::debug!("No Map definitions found");
-        return Ok(ElfParseResult {
-            bytecode,
-            map_fds: Vec::new(),
-        });
-    }
-
-    // Create Maps and build name->fd mapping
-    let mut map_name_to_fd: BTreeMap<String, u32> = BTreeMap::new();
+    // Phase 2: Create maps from aya-obj descriptors
     let mut map_fds: Vec<(String, u32)> = Vec::new();
 
-    for map_def in &map_defs {
-        // Convert BPF map type to our MapType
-        let map_type = match map_def.map_type {
-            1 => crate::maps::MapType::HashMap, // BPF_MAP_TYPE_HASH
-            2 => crate::maps::MapType::Array,   // BPF_MAP_TYPE_ARRAY
-            9 => crate::maps::MapType::LruHash, // BPF_MAP_TYPE_LRU_HASH
-            22 => crate::maps::MapType::Queue,  // BPF_MAP_TYPE_QUEUE
-            _ => {
+    for (name, map) in &obj.maps {
+        let map_type = match map.map_type() {
+            1 => crate::maps::MapType::HashMap,   // BPF_MAP_TYPE_HASH
+            2 => crate::maps::MapType::Array,      // BPF_MAP_TYPE_ARRAY
+            9 => crate::maps::MapType::LruHash,    // BPF_MAP_TYPE_LRU_HASH
+            22 => crate::maps::MapType::Queue,     // BPF_MAP_TYPE_QUEUE
+            unsupported => {
                 log::warn!(
-                    "Unsupported map type {} for '{}'",
-                    map_def.map_type,
-                    map_def.name
+                    "map '{}': unsupported BPF map type {} (only Hash=1, Array=2, LRU=9, Queue=22 are supported)",
+                    name, unsupported
                 );
+                // Cleanup already created maps
+                for (_, fd) in &map_fds {
+                    let _ = crate::maps::destroy(*fd);
+                }
                 return Err(Error::MapCreationFailed);
             }
         };
 
         let def = crate::maps::MapDef {
             map_type,
-            key_size: map_def.key_size,
-            value_size: map_def.value_size,
-            max_entries: map_def.max_entries,
+            key_size: map.key_size(),
+            value_size: map.value_size(),
+            max_entries: map.max_entries(),
         };
 
         match crate::maps::create(&def) {
             Ok(fd) => {
-                log::info!("Created Map '{}' with FD {}", map_def.name, fd);
-                map_name_to_fd.insert(map_def.name.clone(), fd);
-                map_fds.push((map_def.name.clone(), fd));
+                log::info!("Created map '{}' with fd {}", name, fd);
+                map_fds.push((name.clone(), fd));
             }
             Err(e) => {
-                log::warn!("Failed to create map '{}': {:?}", map_def.name, e);
-                // Cleanup already created maps
+                log::warn!("Failed to create map '{}': {:?}", name, e);
                 for (_, fd) in &map_fds {
                     let _ = crate::maps::destroy(*fd);
                 }
@@ -456,35 +156,96 @@ fn parse_elf_with_maps(elf_data: &[u8]) -> Result<ElfParseResult, Error> {
         }
     }
 
-    // Parse and apply relocations
-    if let Some((rel_offset, rel_size)) = rel_section {
-        let rel_data = &elf_data[rel_offset..rel_offset + rel_size];
-        let relocs = parse_relocation_section(rel_data);
+    // Phase 3: Relocate — maps AND function calls (.text linking)
+    //
+    // text_sections tells relocate_maps which section indices contain code
+    // (so it can resolve BPF-to-BPF call relocations via FunctionLinker
+    // instead of treating them as map relocations).
+    let text_sections: HashSet<usize> = obj
+        .functions
+        .keys()
+        .map(|(section_index, _)| *section_index)
+        .collect();
 
-        for reloc in relocs {
-            // Find symbol name
-            let sym_name = symbols
-                .get(reloc.symbol_idx)
-                .map(|(name, _, _)| name.as_str())
-                .unwrap_or("");
+    if !map_fds.is_empty() || !text_sections.is_empty() {
+        // Take maps out of obj to avoid borrow conflict:
+        // relocate_maps needs &mut self, but also needs &Map references.
+        // By taking maps out, we can pass &Map refs without borrowing obj immutably.
+        let taken_maps = core::mem::take(&mut obj.maps);
 
-            if sym_name.is_empty() {
-                log::warn!(
-                    "Empty symbol name for relocation at offset {:#x}",
-                    reloc.offset
-                );
-                continue;
+        let maps_for_reloc: Vec<(&str, core::ffi::c_int, &aya_obj::maps::Map)> = map_fds
+            .iter()
+            .filter_map(|(name, fd)| {
+                taken_maps.get(name.as_str()).map(|map| {
+                    (name.as_str(), *fd as core::ffi::c_int, map)
+                })
+            })
+            .collect();
+
+        let reloc_result = obj.relocate_maps(maps_for_reloc.into_iter(), &text_sections);
+
+        // Put maps back regardless of result
+        obj.maps = taken_maps;
+
+        reloc_result.map_err(|e| {
+            log::warn!("aya-obj map relocation error: {e:?}");
+            for (_, fd) in &map_fds {
+                let _ = crate::maps::destroy(*fd);
             }
-
-            // Find Map FD for this symbol
-            // Skip non-Map symbols (like memcpy, memset, etc.)
-            if let Some(&fd) = map_name_to_fd.get(sym_name) {
-                patch_map_fd(&mut bytecode, reloc.offset, fd)?;
-            }
-            // Note: Non-Map relocations (memcpy, etc.) are silently skipped
-            // as they are handled by the eBPF VM's built-in functions
-        }
+            Error::RelocationFailed
+        })?;
     }
+
+    // Phase 3b: Relocate function calls (.text section linking)
+    //
+    // This merges .text section sub-functions (memcpy, memmove, memset)
+    // into the program's instruction stream and patches BPF_PSEUDO_CALL
+    // imm fields with correct relative offsets.
+    obj.relocate_calls(&text_sections).map_err(|e| {
+        log::warn!("aya-obj call relocation error: {e:?}");
+        for (_, fd) in &map_fds {
+            let _ = crate::maps::destroy(*fd);
+        }
+        Error::RelocationFailed
+    })?;
+
+    // Phase 4: Select program and extract bytecode
+    let program = match prog_name {
+        Some(name) => obj.programs.get(name).ok_or_else(|| {
+            log::warn!("Program '{}' not found in ELF (available: {:?})",
+                name, obj.programs.keys().collect::<Vec<_>>());
+            Error::NotFound
+        })?,
+        None => obj.programs.values().next().ok_or_else(|| {
+            log::warn!("No programs found in ELF");
+            Error::ElfParseError
+        })?,
+    };
+
+    let func_key = (program.section_index, program.address);
+
+    let function = obj.functions.get(&func_key).ok_or_else(|| {
+        log::warn!("Function for program not found (key: {:?})", func_key);
+        Error::ElfParseError
+    })?;
+
+    // Convert Vec<bpf_insn> to Vec<u8>
+    // bpf_insn is #[repr(C)], 8 bytes each, safe to reinterpret as bytes.
+    let insn_count = function.instructions.len();
+    let bytecode: Vec<u8> = unsafe {
+        core::slice::from_raw_parts(
+            function.instructions.as_ptr() as *const u8,
+            insn_count * 8,
+        )
+    }
+    .to_vec();
+
+    log::debug!(
+        "Extracted program bytecode: {} instructions ({} bytes), {} maps",
+        insn_count,
+        bytecode.len(),
+        map_fds.len()
+    );
 
     Ok(ElfParseResult { bytecode, map_fds })
 }
@@ -534,10 +295,10 @@ impl EbpfProgram {
     ///
     /// # Returns
     /// EbpfProgram on success, Error if bytecode is invalid.
-    pub fn new(data: &[u8]) -> Result<Self, Error> {
+    pub fn new(data: &[u8], prog_name: Option<&str>) -> Result<Self, Error> {
         let (bytecode, map_fds) = if is_elf(data) {
-            log::debug!("Detected ELF format, parsing with Map support...");
-            let result = parse_elf_with_maps(data)?;
+            log::debug!("Detected ELF format, parsing with aya-obj...");
+            let result = parse_elf_with_aya(data, prog_name)?;
             (result.bytecode, result.map_fds)
         } else {
             (data.to_vec(), Vec::new())
@@ -632,8 +393,8 @@ static PROGRAM_REGISTRY: Mutex<Vec<Option<EbpfProgram>>> = Mutex::new(Vec::new()
 ///
 /// # Returns
 /// Program ID on success.
-pub fn load_program(bytecode: &[u8]) -> Result<u32, Error> {
-    let program = EbpfProgram::new(bytecode)?;
+pub fn load_program(bytecode: &[u8], prog_name: Option<&str>) -> Result<u32, Error> {
+    let program = EbpfProgram::new(bytecode, prog_name)?;
     let mut registry = PROGRAM_REGISTRY.lock();
 
     // Find empty slot or append
@@ -729,35 +490,6 @@ pub fn list_programs() -> Vec<ProgramInfo> {
             })
         })
         .collect()
-}
-
-// =============================================================================
-// Legacy API (backward compatible)
-// =============================================================================
-
-/// Execute an eBPF program without input data.
-///
-/// # Arguments
-/// * `prog` - The eBPF bytecode
-///
-/// # Returns
-/// The return value of the eBPF program (r0 register).
-pub fn execute(prog: &[u8]) -> Result<u64, Error> {
-    let program = EbpfProgram::new(prog)?;
-    program.execute()
-}
-
-/// Execute an eBPF program with memory context.
-///
-/// # Arguments
-/// * `prog` - The eBPF bytecode
-/// * `mem` - Memory buffer accessible to the program
-///
-/// # Returns
-/// The return value of the eBPF program (r0 register).
-pub fn execute_with_mem(prog: &[u8], mem: &mut [u8]) -> Result<u64, Error> {
-    let program = EbpfProgram::new(prog)?;
-    program.execute_with_context(mem)
 }
 
 // =============================================================================
