@@ -23,10 +23,10 @@ const PROG_RETURN_ZERO: &[u8] = &[
 
 #[test]
 fn test_attach_success() {
-    let prog_id = runtime::load_program(PROG_RETURN_42).unwrap();
+    let prog_id = runtime::load_program(PROG_RETURN_42, None).unwrap();
     let tracepoint = "test:attach_success";
 
-    let result = attach::attach(tracepoint, prog_id);
+    let result = attach::attach(tracepoint, prog_id, "test");
     assert!(result.is_ok());
 
     // Cleanup
@@ -36,21 +36,21 @@ fn test_attach_success() {
 
 #[test]
 fn test_attach_program_not_found() {
-    let result = attach::attach("test:nonexistent_prog", 99999);
+    let result = attach::attach("test:nonexistent_prog", 99999, "test");
     assert!(matches!(result, Err(Error::ProgramNotFound(99999))));
 }
 
 #[test]
 fn test_attach_already_attached() {
-    let prog_id = runtime::load_program(PROG_RETURN_42).unwrap();
+    let prog_id = runtime::load_program(PROG_RETURN_42, None).unwrap();
     let tracepoint = "test:already_attached";
 
     // First attach should succeed
-    attach::attach(tracepoint, prog_id).unwrap();
+    attach::attach(tracepoint, prog_id, "test").unwrap();
 
     // Second attach to same tracepoint should fail
-    let prog_id2 = runtime::load_program(PROG_RETURN_ZERO).unwrap();
-    let result = attach::attach(tracepoint, prog_id2);
+    let prog_id2 = runtime::load_program(PROG_RETURN_ZERO, None).unwrap();
+    let result = attach::attach(tracepoint, prog_id2, "test");
     assert!(matches!(result, Err(Error::AlreadyAttached(_))));
 
     // Cleanup
@@ -65,14 +65,14 @@ fn test_attach_already_attached() {
 
 #[test]
 fn test_detach_success() {
-    let prog_id = runtime::load_program(PROG_RETURN_42).unwrap();
+    let prog_id = runtime::load_program(PROG_RETURN_42, None).unwrap();
     let tracepoint = "test:detach_success";
 
-    attach::attach(tracepoint, prog_id).unwrap();
+    attach::attach(tracepoint, prog_id, "test").unwrap();
     let result = attach::detach(tracepoint);
 
     assert!(result.is_ok());
-    assert_eq!(result.unwrap(), prog_id);
+    assert_eq!(result.unwrap().prog_id, prog_id);
 
     // Cleanup
     let _ = runtime::unload_program(prog_id);
@@ -90,13 +90,14 @@ fn test_detach_not_attached() {
 
 #[test]
 fn test_get_attached_exists() {
-    let prog_id = runtime::load_program(PROG_RETURN_42).unwrap();
+    let prog_id = runtime::load_program(PROG_RETURN_42, None).unwrap();
     let tracepoint = "test:get_attached_exists";
 
-    attach::attach(tracepoint, prog_id).unwrap();
+    attach::attach(tracepoint, prog_id, "test").unwrap();
     let result = attach::get_attached(tracepoint);
 
-    assert_eq!(result, Some(prog_id));
+    assert!(result.is_some());
+    assert_eq!(result.unwrap().prog_id, prog_id);
 
     // Cleanup
     let _ = attach::detach(tracepoint);
@@ -106,19 +107,19 @@ fn test_get_attached_exists() {
 #[test]
 fn test_get_attached_not_exists() {
     let result = attach::get_attached("test:nonexistent");
-    assert_eq!(result, None);
+    assert!(result.is_none());
 }
 
 #[test]
 fn test_get_attached_after_detach() {
-    let prog_id = runtime::load_program(PROG_RETURN_42).unwrap();
+    let prog_id = runtime::load_program(PROG_RETURN_42, None).unwrap();
     let tracepoint = "test:get_after_detach";
 
-    attach::attach(tracepoint, prog_id).unwrap();
+    attach::attach(tracepoint, prog_id, "test").unwrap();
     attach::detach(tracepoint).unwrap();
 
     let result = attach::get_attached(tracepoint);
-    assert_eq!(result, None);
+    assert!(result.is_none());
 
     // Cleanup
     let _ = runtime::unload_program(prog_id);
@@ -130,23 +131,23 @@ fn test_get_attached_after_detach() {
 
 #[test]
 fn test_list_attachments() {
-    let prog_id1 = runtime::load_program(PROG_RETURN_42).unwrap();
-    let prog_id2 = runtime::load_program(PROG_RETURN_ZERO).unwrap();
+    let prog_id1 = runtime::load_program(PROG_RETURN_42, None).unwrap();
+    let prog_id2 = runtime::load_program(PROG_RETURN_ZERO, None).unwrap();
     let tp1 = "test:list_attach_1";
     let tp2 = "test:list_attach_2";
 
-    attach::attach(tp1, prog_id1).unwrap();
-    attach::attach(tp2, prog_id2).unwrap();
+    attach::attach(tp1, prog_id1, "test1").unwrap();
+    attach::attach(tp2, prog_id2, "test2").unwrap();
 
     let attachments = attach::list_attachments();
 
     // Check that our attachments are in the list
     let has_tp1 = attachments
         .iter()
-        .any(|(name, id)| name == tp1 && *id == prog_id1);
+        .any(|(name, info)| name == tp1 && info.prog_id == prog_id1);
     let has_tp2 = attachments
         .iter()
-        .any(|(name, id)| name == tp2 && *id == prog_id2);
+        .any(|(name, info)| name == tp2 && info.prog_id == prog_id2);
 
     assert!(has_tp1, "tp1 should be in attachments");
     assert!(has_tp2, "tp2 should be in attachments");
@@ -166,10 +167,10 @@ fn test_list_attachments() {
 fn test_attachment_count() {
     let initial_count = attach::attachment_count();
 
-    let prog_id = runtime::load_program(PROG_RETURN_42).unwrap();
+    let prog_id = runtime::load_program(PROG_RETURN_42, None).unwrap();
     let tracepoint = "test:count_test";
 
-    attach::attach(tracepoint, prog_id).unwrap();
+    attach::attach(tracepoint, prog_id, "test").unwrap();
     assert_eq!(attach::attachment_count(), initial_count + 1);
 
     attach::detach(tracepoint).unwrap();
@@ -204,20 +205,24 @@ fn test_error_display() {
 
 #[test]
 fn test_reattach_after_detach() {
-    let prog_id = runtime::load_program(PROG_RETURN_42).unwrap();
+    let prog_id = runtime::load_program(PROG_RETURN_42, None).unwrap();
     let tracepoint = "test:reattach";
 
     // Attach
-    attach::attach(tracepoint, prog_id).unwrap();
-    assert_eq!(attach::get_attached(tracepoint), Some(prog_id));
+    attach::attach(tracepoint, prog_id, "test").unwrap();
+    let info = attach::get_attached(tracepoint);
+    assert!(info.is_some());
+    assert_eq!(info.unwrap().prog_id, prog_id);
 
     // Detach
     attach::detach(tracepoint).unwrap();
-    assert_eq!(attach::get_attached(tracepoint), None);
+    assert!(attach::get_attached(tracepoint).is_none());
 
     // Reattach same program
-    attach::attach(tracepoint, prog_id).unwrap();
-    assert_eq!(attach::get_attached(tracepoint), Some(prog_id));
+    attach::attach(tracepoint, prog_id, "test").unwrap();
+    let info = attach::get_attached(tracepoint);
+    assert!(info.is_some());
+    assert_eq!(info.unwrap().prog_id, prog_id);
 
     // Cleanup
     let _ = attach::detach(tracepoint);
@@ -226,20 +231,24 @@ fn test_reattach_after_detach() {
 
 #[test]
 fn test_attach_different_program_after_detach() {
-    let prog_id1 = runtime::load_program(PROG_RETURN_42).unwrap();
-    let prog_id2 = runtime::load_program(PROG_RETURN_ZERO).unwrap();
+    let prog_id1 = runtime::load_program(PROG_RETURN_42, None).unwrap();
+    let prog_id2 = runtime::load_program(PROG_RETURN_ZERO, None).unwrap();
     let tracepoint = "test:different_prog";
 
     // Attach first program
-    attach::attach(tracepoint, prog_id1).unwrap();
-    assert_eq!(attach::get_attached(tracepoint), Some(prog_id1));
+    attach::attach(tracepoint, prog_id1, "test1").unwrap();
+    let info = attach::get_attached(tracepoint);
+    assert!(info.is_some());
+    assert_eq!(info.unwrap().prog_id, prog_id1);
 
     // Detach
     attach::detach(tracepoint).unwrap();
 
     // Attach different program
-    attach::attach(tracepoint, prog_id2).unwrap();
-    assert_eq!(attach::get_attached(tracepoint), Some(prog_id2));
+    attach::attach(tracepoint, prog_id2, "test2").unwrap();
+    let info = attach::get_attached(tracepoint);
+    assert!(info.is_some());
+    assert_eq!(info.unwrap().prog_id, prog_id2);
 
     // Cleanup
     let _ = attach::detach(tracepoint);

@@ -47,7 +47,7 @@ pub fn example_with_map() {
     }
 
     // Load and execute a simple program
-    let program = EbpfProgram::new(SIMPLE_PROGRAM).expect("Failed to load program");
+    let program = EbpfProgram::new(SIMPLE_PROGRAM, None).expect("Failed to load program");
     let result = program.execute().expect("Failed to execute");
     log::info!("Program returned: {}", result);
 }
@@ -58,7 +58,7 @@ pub fn example_with_registry() {
     use crate::runtime;
 
     // Load program into registry
-    let prog_id = runtime::load_program(SIMPLE_PROGRAM).expect("Failed to load");
+    let prog_id = runtime::load_program(SIMPLE_PROGRAM, None).expect("Failed to load");
     log::info!("Loaded program with ID: {}", prog_id);
 
     // Run multiple times
