@@ -23,14 +23,6 @@ impl ProgramRegistry {
     pub fn list() -> Vec<PrecompiledProgram> {
         let mut programs = Vec::new();
 
-        if !bytecode::STATS.is_empty() {
-            programs.push(PrecompiledProgram {
-                name: "stats",
-                description: "Statistics collector (COUNT/TOTAL/MIN/MAX)",
-                bytecode: bytecode::STATS,
-            });
-        }
-
         if !bytecode::PRINTK.is_empty() {
             programs.push(PrecompiledProgram {
                 name: "printk",
@@ -39,27 +31,19 @@ impl ProgramRegistry {
             });
         }
 
-        if !bytecode::KPROBE_ARGS.is_empty() {
+        if !bytecode::HPROBE_ENTRY.is_empty() {
             programs.push(PrecompiledProgram {
-                name: "kprobe_args",
-                description: "Kprobe argument tracer (captures x0-x3)",
-                bytecode: bytecode::KPROBE_ARGS,
+                name: "hprobe_entry",
+                description: "Hprobe entry tracer (captures x0-x3 arguments)",
+                bytecode: bytecode::HPROBE_ENTRY,
             });
         }
 
-        if !bytecode::KPROBE_SIMPLE.is_empty() {
+        if !bytecode::HPROBE_EXIT.is_empty() {
             programs.push(PrecompiledProgram {
-                name: "kprobe_simple",
-                description: "Simple kprobe tracer (captures x0 only)",
-                bytecode: bytecode::KPROBE_SIMPLE,
-            });
-        }
-
-        if !bytecode::KPROBE_NOOP.is_empty() {
-            programs.push(PrecompiledProgram {
-                name: "kprobe_noop",
-                description: "Minimal noop kprobe (just returns 1)",
-                bytecode: bytecode::KPROBE_NOOP,
+                name: "hprobe_exit",
+                description: "Hprobe exit tracer (captures return value x0)",
+                bytecode: bytecode::HPROBE_EXIT,
             });
         }
 
@@ -69,30 +53,20 @@ impl ProgramRegistry {
     /// Get pre-compiled program by name
     pub fn get(name: &str) -> Option<PrecompiledProgram> {
         match name {
-            "stats" if !bytecode::STATS.is_empty() => Some(PrecompiledProgram {
-                name: "stats",
-                description: "Statistics collector (COUNT/TOTAL/MIN/MAX)",
-                bytecode: bytecode::STATS,
-            }),
             "printk" if !bytecode::PRINTK.is_empty() => Some(PrecompiledProgram {
                 name: "printk",
                 description: "Debug logger (prints tracepoint name and count)",
                 bytecode: bytecode::PRINTK,
             }),
-            "kprobe_args" if !bytecode::KPROBE_ARGS.is_empty() => Some(PrecompiledProgram {
-                name: "kprobe_args",
-                description: "Kprobe argument tracer (captures x0-x3)",
-                bytecode: bytecode::KPROBE_ARGS,
+            "hprobe_entry" if !bytecode::HPROBE_ENTRY.is_empty() => Some(PrecompiledProgram {
+                name: "hprobe_entry",
+                description: "Hprobe entry tracer (captures x0-x3 arguments)",
+                bytecode: bytecode::HPROBE_ENTRY,
             }),
-            "kprobe_simple" if !bytecode::KPROBE_SIMPLE.is_empty() => Some(PrecompiledProgram {
-                name: "kprobe_simple",
-                description: "Simple kprobe tracer (captures x0 only)",
-                bytecode: bytecode::KPROBE_SIMPLE,
-            }),
-            "kprobe_noop" if !bytecode::KPROBE_NOOP.is_empty() => Some(PrecompiledProgram {
-                name: "kprobe_noop",
-                description: "Minimal noop kprobe (just returns 1)",
-                bytecode: bytecode::KPROBE_NOOP,
+            "hprobe_exit" if !bytecode::HPROBE_EXIT.is_empty() => Some(PrecompiledProgram {
+                name: "hprobe_exit",
+                description: "Hprobe exit tracer (captures return value x0)",
+                bytecode: bytecode::HPROBE_EXIT,
             }),
             _ => None,
         }
@@ -100,6 +74,6 @@ impl ProgramRegistry {
 
     /// Check if any pre-compiled programs are available
     pub fn is_available() -> bool {
-        !bytecode::STATS.is_empty() || !bytecode::PRINTK.is_empty() || !bytecode::KPROBE_ARGS.is_empty()
+        !bytecode::PRINTK.is_empty() || !bytecode::HPROBE_ENTRY.is_empty() || !bytecode::HPROBE_EXIT.is_empty()
     }
 }

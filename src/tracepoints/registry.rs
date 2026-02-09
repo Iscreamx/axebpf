@@ -40,45 +40,16 @@ pub fn list_all() -> Vec<(u32, &'static str)> {
 /// Initialize registry with all known tracepoints.
 pub fn init() {
     // VM lifecycle
-    register(1, "vmm:vm_create");
-    register(2, "vmm:vm_boot");
-    register(3, "vmm:vm_shutdown");
     register(4, "vmm:vm_destroy");
-
-    // vCPU lifecycle
-    register(10, "vmm:vcpu_create");
-    register(11, "vmm:vcpu_destroy");
-    register(12, "vmm:vcpu_state_change");
-
-    // vCPU runtime
-    register(20, "vmm:vcpu_run_enter");
-    register(21, "vmm:vcpu_run_exit");
-    register(22, "vmm:hypercall");
-    register(23, "vmm:external_interrupt");
-    register(24, "vmm:vcpu_halt");
-    register(25, "vmm:cpu_up");
-    register(26, "vmm:ipi_send");
-
-    // Memory management
-    register(30, "vmm:memory_map");
-    register(31, "vmm:memory_unmap");
-    register(32, "vmm:page_fault");
-
-    // Device/IRQ
-    register(40, "vmm:device_access");
-    register(41, "vmm:irq_inject");
-    register(42, "vmm:irq_handle");
 
     // System initialization
     register(50, "vmm:vmm_init");
-    register(51, "vmm:vhal_init");
     register(52, "vmm:config_load");
     register(53, "vmm:image_load");
 
     // Timer
     register(60, "vmm:timer_tick");
     register(61, "vmm:timer_event");
-    register(62, "vmm:task_switch");
 
     // Shell
     register(100, "shell:shell_command");
