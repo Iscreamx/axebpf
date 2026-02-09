@@ -10,8 +10,8 @@ pub mod manager;
 pub mod ops;
 
 pub use manager::{
-    attach, detach, disable, enable, init, list_all, lookup, lookup_prog_id, record_hit, register,
+    attach, detach, disable, enable, init, list_all, register,
     unregister, KprobeEntry, KprobeRegistry, KprobeState,
 };
-pub use handler::{handle_breakpoint, get_original_pc, save_original_pc};
+pub use handler::handle_breakpoint;
 pub use ops::AxKprobeOps;

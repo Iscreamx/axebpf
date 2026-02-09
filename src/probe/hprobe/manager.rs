@@ -16,6 +16,15 @@ use crate::symbols;
 /// Lock type alias for the kprobe library
 type LockType = spin::Mutex<()>;
 
+/// User data attached to each probe instance.
+/// Passed to callbacks via `ProbeData`, avoiding lock-table lookups.
+#[derive(Clone, Debug)]
+struct HprobeUserData {
+    prog_id: u32,
+    probe_addr: usize,
+    symbol: String,
+}
+
 /// Kprobe state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KprobeState {
@@ -51,7 +60,7 @@ pub struct KprobeEntry {
 }
 
 /// Global kprobe registry
-static KPROBE_REGISTRY: Mutex<Option<KprobeRegistry>> = Mutex::new(None);
+pub(super) static KPROBE_REGISTRY: Mutex<Option<KprobeRegistry>> = Mutex::new(None);
 
 /// Kprobe registry
 pub struct KprobeRegistry {
@@ -114,21 +123,15 @@ impl KprobeRegistry {
             return Ok(());
         }
 
-        // Build and register the kprobe with the library
-        let builder = kprobe::ProbeBuilder::<AxKprobeOps>::new()
-            .with_symbol_addr(addr)
-            .with_symbol(entry.name.clone())
-            .with_enable(true)
-            .with_pre_handler(kprobe_pre_handler);
-
         let handle = if entry.is_ret {
-            // For kretprobe, use the kretprobe builder
+            // For kretprobe, use the kretprobe builder with user data
             let ret_builder = kprobe::KretprobeBuilder::<LockType>::new(16) // maxactive = 16
                 .with_symbol_addr(addr)
                 .with_symbol(entry.name.clone())
                 .with_enable(true)
-                .with_entry_handler(kprobe_pre_handler)
-                .with_ret_handler(kprobe_post_handler);
+                .with_entry_handler(kprobe_entry_handler)
+                .with_ret_handler(kprobe_ret_handler)
+                .with_data(HprobeUserData { prog_id: entry.prog_id, probe_addr: addr, symbol: entry.name.clone() });
 
             let kretprobe = kprobe::register_kretprobe(
                 &mut self.manager,
@@ -137,6 +140,14 @@ impl KprobeRegistry {
             );
             ProbeHandle::Kretprobe(kretprobe)
         } else {
+            // For kprobe, use the probe builder with user data
+            let builder = kprobe::ProbeBuilder::<AxKprobeOps>::new()
+                .with_symbol_addr(addr)
+                .with_symbol(entry.name.clone())
+                .with_enable(true)
+                .with_pre_handler(kprobe_pre_handler)
+                .with_data(HprobeUserData { prog_id: entry.prog_id, probe_addr: addr, symbol: entry.name.clone() });
+
             let kp = kprobe::register_kprobe(
                 &mut self.manager,
                 &mut self.probe_points,
@@ -238,23 +249,13 @@ impl KprobeRegistry {
     }
 }
 
-/// Pre-handler callback for kprobes - executes associated eBPF program
-fn kprobe_pre_handler(_data: &dyn kprobe::ProbeData, pt_regs: &mut kprobe::PtRegs) {
-    #[cfg(target_arch = "aarch64")]
-    let addr = pt_regs.pc as usize;
-    #[cfg(target_arch = "x86_64")]
-    let addr = pt_regs.rip as usize;
-
-    // Look up associated eBPF program
-    let prog_id = match lookup_prog_id(addr) {
-        Some(id) => id,
-        None => {
-            log::debug!("kprobe: no eBPF program for {:#x}", addr);
-            return;
-        }
+/// Pre-handler for kprobe (non-ret): execute eBPF on function entry.
+/// Retrieves prog_id from user_data instead of locking the registry.
+fn kprobe_pre_handler(data: &dyn kprobe::ProbeData, pt_regs: &mut kprobe::PtRegs) {
+    let Some(ud) = data.as_any().downcast_ref::<HprobeUserData>() else {
+        return;
     };
 
-    // Pass pt_regs directly to eBPF (zero-copy, aya compatible)
     #[cfg(feature = "runtime")]
     {
         let ctx_bytes = unsafe {
@@ -263,37 +264,33 @@ fn kprobe_pre_handler(_data: &dyn kprobe::ProbeData, pt_regs: &mut kprobe::PtReg
                 core::mem::size_of::<kprobe::PtRegs>(),
             )
         };
-        if let Err(e) = crate::runtime::run_program(prog_id, Some(ctx_bytes)) {
-            log::warn!("kprobe: eBPF execution failed at {:#x}: {:?}", addr, e);
+        if let Err(e) = crate::runtime::run_program(ud.prog_id, Some(ctx_bytes)) {
+            log::warn!("hprobe: eBPF execution failed at {:#x}: {:?}", ud.probe_addr, e);
+        }
+
+        if crate::attach::is_verbose() {
+            let regs = &*pt_regs;
+            log::info!(
+                "[hprobe] ENTRY {} x0={:#x} x1={:#x} x2={:#x} x3={:#x}",
+                ud.symbol, regs.regs[0], regs.regs[1], regs.regs[2], regs.regs[3]
+            );
         }
     }
-
-    #[cfg(not(feature = "runtime"))]
-    {
-        log::debug!("kprobe: runtime not enabled, skipping eBPF execution for prog {}", prog_id);
-    }
-
-    // Record hit
-    record_hit(addr);
 }
 
-/// Post-handler callback for kretprobes - executes associated eBPF program
-fn kprobe_post_handler(_data: &dyn kprobe::ProbeData, pt_regs: &mut kprobe::PtRegs) {
-    #[cfg(target_arch = "aarch64")]
-    let addr = pt_regs.pc as usize;
-    #[cfg(target_arch = "x86_64")]
-    let addr = pt_regs.rip as usize;
+/// Entry handler for kretprobe: called at function entry before LR replacement.
+/// No eBPF execution here; the return handler runs eBPF on function return.
+fn kprobe_entry_handler(_data: &dyn kprobe::ProbeData, _pt_regs: &mut kprobe::PtRegs) {
+    // Intentionally empty: for kretprobe, eBPF runs on return, not entry.
+}
 
-    // Look up associated eBPF program
-    let prog_id = match lookup_prog_id(addr) {
-        Some(id) => id,
-        None => {
-            log::debug!("kretprobe: no eBPF program for {:#x}", addr);
-            return;
-        }
+/// Return handler for kretprobe: execute eBPF when the probed function returns.
+/// Called from the kprobe library's trampoline mechanism.
+fn kprobe_ret_handler(data: &dyn kprobe::ProbeData, pt_regs: &mut kprobe::PtRegs) {
+    let Some(ud) = data.as_any().downcast_ref::<HprobeUserData>() else {
+        return;
     };
 
-    // Pass pt_regs directly to eBPF (zero-copy, aya compatible)
     #[cfg(feature = "runtime")]
     {
         let ctx_bytes = unsafe {
@@ -302,14 +299,17 @@ fn kprobe_post_handler(_data: &dyn kprobe::ProbeData, pt_regs: &mut kprobe::PtRe
                 core::mem::size_of::<kprobe::PtRegs>(),
             )
         };
-        if let Err(e) = crate::runtime::run_program(prog_id, Some(ctx_bytes)) {
-            log::warn!("kretprobe: eBPF execution failed at {:#x}: {:?}", addr, e);
+        if let Err(e) = crate::runtime::run_program(ud.prog_id, Some(ctx_bytes)) {
+            log::warn!("hretprobe: eBPF execution failed at {:#x}: {:?}", ud.probe_addr, e);
         }
-    }
 
-    #[cfg(not(feature = "runtime"))]
-    {
-        log::debug!("kretprobe: runtime not enabled, skipping eBPF execution for prog {}", prog_id);
+        if crate::attach::is_verbose() {
+            let regs = &*pt_regs;
+            log::info!(
+                "[hprobe] EXIT {} retval={:#x}",
+                ud.symbol, regs.regs[0]
+            );
+        }
     }
 }
 
@@ -357,34 +357,6 @@ pub fn unregister(addr: usize) -> Result<(), &'static str> {
     let mut registry = KPROBE_REGISTRY.lock();
     let registry = registry.as_mut().ok_or("kprobe subsystem not initialized")?;
     registry.unregister(addr)
-}
-
-/// Look up kprobe by address.
-pub fn lookup(addr: usize) -> Option<bool> {
-    let registry = KPROBE_REGISTRY.lock();
-    registry.as_ref().and_then(|r| r.get(addr).map(|e| e.state == KprobeState::Enabled))
-}
-
-/// Look up the eBPF program ID for a kprobe by address.
-pub fn lookup_prog_id(addr: usize) -> Option<u32> {
-    let registry = KPROBE_REGISTRY.lock();
-    registry.as_ref().and_then(|r| {
-        r.get(addr).and_then(|e| {
-            if e.state == KprobeState::Enabled {
-                Some(e.prog_id)
-            } else {
-                None
-            }
-        })
-    })
-}
-
-/// Record a kprobe hit.
-pub fn record_hit(addr: usize) {
-    let mut registry = KPROBE_REGISTRY.lock();
-    if let Some(registry) = registry.as_mut() {
-        registry.record_hit(addr);
-    }
 }
 
 /// List all kprobes for shell command.
