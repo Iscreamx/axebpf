@@ -30,6 +30,8 @@ pub fn execute_attached_program(tracepoint_name: &str, timestamp: u64, duration_
             arg1: 0,
             arg2: 0,
             arg3: 0,
+            probe_type: 0,
+            _reserved: 0,
         };
 
         // Execute program
