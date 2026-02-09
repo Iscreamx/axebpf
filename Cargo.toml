@@ -9,10 +9,11 @@ authors = ["iscreamx404@gmail.com"]
 default = ["symbols", "tracepoint-support", "runtime", "axhal"]
 symbols = ["ksym"]
 tracepoint-support = ["symbols", "dep:tracepoint", "tp-lexer", "spin", "static-keys"]
-runtime = ["rbpf", "kbpf-basic", "spin"]
+runtime = ["rbpf", "kbpf-basic", "spin", "dep:aya-obj", "dep:hashbrown"]
 axhal = ["dep:axhal"]
 precompiled-ebpf = []
-kprobe = ["tracepoint-support", "dep:kprobe"]
+hprobe = ["tracepoint-support", "dep:kprobe"]
+guest-kprobe = ["hprobe"]
 
 [dependencies]
 log = "0.4"
@@ -33,6 +34,8 @@ static-keys = { version = "0.8.2", default-features = false, optional = true }
 # runtime feature
 rbpf = { git = "https://github.com/qmonnet/rbpf", default-features = false, optional = true }
 kbpf-basic = { git = "https://github.com/Starry-OS/kbpf-basic.git", optional = true }
+aya-obj = { git = "https://github.com/aya-rs/aya", branch = "main", default-features = false, optional = true }
+hashbrown = { version = "0.16", default-features = false, optional = true }
 
 # kprobe feature
 kprobe = { git = "https://github.com/Starry-OS/kprobe.git", optional = true }

@@ -8,7 +8,7 @@
 //! This module handles both BRK exceptions to complete the kprobe flow.
 
 use crate::insn_slot;
-use crate::kprobe_manager;
+use crate::probe::hprobe::manager as kprobe_manager;
 
 /// BRK immediate values used by kprobe library (from arch/aarch64/mod.rs)
 /// ISS field in ESR contains the immediate value

@@ -6,10 +6,11 @@ extern crate alloc;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-use crate::kprobe_ops::AxKprobeOps;
+use crate::probe::hprobe::ops::AxKprobeOps;
 use crate::symbols;
 
 /// Lock type alias for the kprobe library
@@ -22,6 +23,13 @@ pub enum KprobeState {
     Disabled,
     /// Kprobe is active and will trigger on function entry
     Enabled,
+}
+
+/// Handle to a registered probe in the kprobe library.
+/// Dropping this handle triggers instruction restoration and slot cleanup.
+enum ProbeHandle {
+    Kprobe(Arc<kprobe::Kprobe<LockType, AxKprobeOps>>),
+    Kretprobe(Arc<kprobe::Kretprobe<LockType, AxKprobeOps>>),
 }
 
 /// Kprobe entry for tracking registered probes
@@ -38,6 +46,8 @@ pub struct KprobeEntry {
     pub is_ret: bool,
     /// Associated eBPF program ID
     pub prog_id: u32,
+    /// Handle to the kprobe library probe, used for proper unregistration
+    handle: Option<ProbeHandle>,
 }
 
 /// Global kprobe registry
@@ -87,6 +97,7 @@ impl KprobeRegistry {
             state: KprobeState::Disabled,
             is_ret,
             prog_id,
+            handle: None,
         };
 
         self.probes.insert(addr, entry);
@@ -110,7 +121,7 @@ impl KprobeRegistry {
             .with_enable(true)
             .with_pre_handler(kprobe_pre_handler);
 
-        if entry.is_ret {
+        let handle = if entry.is_ret {
             // For kretprobe, use the kretprobe builder
             let ret_builder = kprobe::KretprobeBuilder::<LockType>::new(16) // maxactive = 16
                 .with_symbol_addr(addr)
@@ -119,19 +130,22 @@ impl KprobeRegistry {
                 .with_entry_handler(kprobe_pre_handler)
                 .with_ret_handler(kprobe_post_handler);
 
-            let _kretprobe = kprobe::register_kretprobe(
+            let kretprobe = kprobe::register_kretprobe(
                 &mut self.manager,
                 &mut self.probe_points,
                 ret_builder,
             );
+            ProbeHandle::Kretprobe(kretprobe)
         } else {
-            let _kprobe = kprobe::register_kprobe(
+            let kp = kprobe::register_kprobe(
                 &mut self.manager,
                 &mut self.probe_points,
                 builder,
             );
-        }
+            ProbeHandle::Kprobe(kp)
+        };
 
+        entry.handle = Some(handle);
         entry.state = KprobeState::Enabled;
         log::info!("kprobe: enabled {} at {:#x}", entry.name, addr);
 
@@ -146,8 +160,28 @@ impl KprobeRegistry {
             return Ok(());
         }
 
-        // TODO: Implement proper unregistration with the kprobe library
-        // For now, just mark as disabled
+        // Take the handle out and unregister via the kprobe library.
+        // This triggers Drop on ProbePoint, which restores the original
+        // instruction and frees the instruction slot.
+        if let Some(handle) = entry.handle.take() {
+            match handle {
+                ProbeHandle::Kprobe(kp) => {
+                    kprobe::unregister_kprobe(
+                        &mut self.manager,
+                        &mut self.probe_points,
+                        kp,
+                    );
+                }
+                ProbeHandle::Kretprobe(krp) => {
+                    kprobe::unregister_kretprobe(
+                        &mut self.manager,
+                        &mut self.probe_points,
+                        krp,
+                    );
+                }
+            }
+        }
+
         entry.state = KprobeState::Disabled;
         log::info!("kprobe: disabled {} at {:#x}", entry.name, addr);
 

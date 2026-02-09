@@ -62,14 +62,8 @@ pub mod insn_slot;
 #[cfg(feature = "tracepoint-support")]
 pub mod page_table;
 
-#[cfg(feature = "kprobe")]
-pub mod kprobe_ops;
-
-#[cfg(feature = "kprobe")]
-pub mod kprobe_manager;
-
-#[cfg(feature = "kprobe")]
-pub mod kprobe_handler;
+#[cfg(feature = "hprobe")]
+pub mod probe;
 
 #[cfg(feature = "tracepoint-support")]
 pub mod trace_ops;
@@ -133,8 +127,15 @@ pub use attach::{AttachmentInfo, is_verbose, set_verbose};
 #[cfg(feature = "runtime")]
 pub use output::{print_ebpf_result, print_if_verbose};
 
-#[cfg(feature = "kprobe")]
+#[cfg(feature = "hprobe")]
 pub use kprobe::PtRegs;
+
+#[cfg(feature = "hprobe")]
+pub use probe::hprobe::manager as hprobe_manager;
+#[cfg(feature = "hprobe")]
+pub use probe::hprobe::handler as hprobe_handler;
+#[cfg(feature = "hprobe")]
+pub use probe::hprobe::ops as hprobe_ops;
 
 // =============================================================================
 // Initialization
