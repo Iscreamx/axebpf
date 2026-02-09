@@ -4,50 +4,67 @@ eBPF runtime, symbol table, and tracepoint framework for AxVisor Hypervisor.
 
 ## Overview
 
-`axebpf` provides a comprehensive eBPF-based tracing infrastructure for AxVisor, enabling dynamic performance analysis and observability of the hypervisor's critical paths.
+`axebpf` provides eBPF-based tracing and dynamic probing infrastructure for AxVisor, enabling runtime performance analysis and observability of both the hypervisor (EL2) and guest kernels (EL1).
 
 ## Features
 
 - **Platform Abstraction** (`platform`) - Testable abstraction over kernel operations
-- **Symbol Table Management** (`symbols`) - Kernel symbol resolution via `ksym`
+- **Symbol Table** (`symbols`) - Kernel symbol resolution via `ksym`
 - **Tracepoint Framework** (`tracepoint-support`) - Static instrumentation points for VMM events
-- **eBPF Runtime** (`runtime`) - Program execution via `rbpf` VM with map support
+- **eBPF Runtime** (`runtime`) - Program execution via `rbpf` VM, ELF loading via `aya-obj`, map support
+- **Hprobe** (`hprobe`) - VMM self-introspection via EL2 breakpoints
+- **Guest Kprobe** (`guest-kprobe`) - Guest kernel probing via Stage-2 faults or BRK injection
 
 ## Module Structure
 
 ```
 axebpf/
 ├── src/
-│   ├── lib.rs              # Module entry point
-│   ├── platform.rs         # Platform abstraction (mock/real kernel ops)
-│   ├── symbols.rs          # Symbol table management (ksym wrapper)
-│   ├── tracepoint.rs       # Tracepoint framework (TracepointManager)
-│   ├── runtime.rs          # eBPF VM and program management
-│   ├── maps.rs             # eBPF map implementations (Array, HashMap, LRU, Queue)
-│   ├── helpers.rs          # Standard eBPF helper functions
-│   ├── attach.rs           # Program attachment management
-│   ├── trace_ops.rs        # Tracepoint operations (KernelTraceOps)
-│   ├── map_ops.rs          # Map operations (KernelAuxiliaryOps for kbpf-basic)
-│   ├── context.rs          # eBPF program execution context
-│   ├── output.rs           # eBPF output buffer management
-│   ├── macros.rs           # Helper macros
-│   ├── examples/           # Usage examples
+│   ├── lib.rs                # Module entry point and initialization
+│   ├── platform.rs           # Platform abstraction (mock/real kernel ops)
+│   ├── symbols.rs            # Symbol table management (ksym wrapper)
+│   ├── tracepoint.rs         # Tracepoint framework (TracepointManager)
+│   ├── runtime.rs            # eBPF VM, ELF loader (aya-obj), program registry
+│   ├── maps.rs               # eBPF map implementations (Array, HashMap, LRU, Queue)
+│   ├── helpers.rs            # Standard eBPF helper functions
+│   ├── attach.rs             # Program attachment management
+│   ├── context.rs            # eBPF program execution context (TraceContext)
+│   ├── output.rs             # eBPF output formatting
+│   ├── trace_ops.rs          # Tracepoint operations (KernelTraceOps)
+│   ├── map_ops.rs            # Map operations (KernelAuxiliaryOps for kbpf-basic)
+│   ├── cache.rs              # Cache operations
+│   ├── insn_slot.rs          # Instruction slot allocator for probe trampolines
+│   ├── page_table.rs         # Page table manipulation for text patching
+│   ├── macros.rs             # Helper macros
+│   ├── probe/                # Unified probe framework
+│   │   ├── mod.rs            # ProbeType enum (Hprobe/Hretprobe/Kprobe/Kretprobe/Tracepoint)
+│   │   ├── hprobe/           # VMM self-introspection (EL2 breakpoints)
+│   │   │   ├── mod.rs
+│   │   │   ├── handler.rs    # BRK exception handler
+│   │   │   ├── manager.rs    # Probe registration and lifecycle
+│   │   │   └── ops.rs        # Low-level patching (instruction slot, text write)
+│   │   └── kprobe/           # Guest kernel probing (cross-privilege)
+│   │       ├── mod.rs
+│   │       ├── handler.rs    # Guest probe exception handler
+│   │       ├── manager.rs    # Guest probe registration (Stage2Fault/BrkInject modes)
+│   │       └── addr_translate.rs  # GVA → IPA address translation
+│   ├── programs/             # Pre-compiled eBPF programs
+│   │   ├── mod.rs
+│   │   ├── bytecode.rs       # Embedded .o files (include_bytes!)
+│   │   └── registry.rs       # ProgramRegistry for name-based lookup
+│   ├── examples/
 │   │   ├── mod.rs
 │   │   └── runtime_example.rs
-│   ├── programs/           # eBPF program management
-│   │   ├── mod.rs          # Program module exports
-│   │   ├── bytecode.rs     # Bytecode utilities
-│   │   └── registry.rs     # Program registry
-│   └── tracepoints/        # VMM-specific tracepoints
-│       ├── mod.rs          # VMM tracepoint exports
-│       ├── vmm.rs          # VMM tracepoint definitions (vm, vcpu, memory, etc.)
-│       ├── shell.rs        # Shell tracepoint definitions
-│       ├── stats.rs        # Built-in statistics collector
-│       ├── registry.rs     # Tracepoint registry
-│       ├── histogram.rs    # Latency distribution histograms
+│   └── tracepoints/          # VMM-specific tracepoint definitions
+│       ├── mod.rs
+│       ├── vmm.rs            # VMM tracepoints (vm, vcpu, memory, etc.)
+│       ├── shell.rs          # Shell tracepoints
+│       ├── stats.rs          # Built-in statistics collector
+│       ├── registry.rs       # Tracepoint registry
+│       ├── histogram.rs      # Latency distribution histograms
 │       └── hypervisor_helpers.rs  # Hypervisor-specific eBPF helpers
 └── tests/
-    ├── runtime_tests.rs           # Runtime/program tests
+    ├── runtime_tests.rs           # Runtime/program/ELF loading tests
     ├── maps_tests.rs              # Map CRUD tests
     ├── helpers_tests.rs           # Helper function tests
     ├── hypervisor_helpers_tests.rs # Hypervisor helper tests
@@ -66,7 +83,10 @@ axebpf/
 | `tracepoint` | [Starry-OS](https://github.com/Starry-OS/tracepoint) | Static tracepoint framework |
 | `tp-lexer` | [Starry-OS](https://github.com/Starry-OS/tp-lexer) | Tracepoint filter expressions |
 | `rbpf` | [qmonnet](https://github.com/qmonnet/rbpf) | eBPF virtual machine |
-| `kbpf-basic` | [Iscreamx](https://github.com/Iscreamx/kbpf-basic) | eBPF map implementations |
+| `kbpf-basic` | [Starry-OS](https://github.com/Starry-OS/kbpf-basic) | eBPF map implementations |
+| `aya-obj` | [aya-rs](https://github.com/aya-rs/aya) | ELF parsing, map/call relocation |
+| `hashbrown` | [crates.io](https://crates.io/crates/hashbrown) | no_std HashMap (required by aya-obj relocation API) |
+| `kprobe` | [Starry-OS](https://github.com/Starry-OS/kprobe.git) | Low-level breakpoint primitives |
 | `axhal` | [arceos](https://github.com/arceos-org/arceos) | Kernel operations (optional, for real platform) |
 
 ## Usage
@@ -75,11 +95,13 @@ axebpf/
 
 ```toml
 [dependencies]
-# For external projects, use git reference
 axebpf = { git = "https://github.com/Iscreamx/axebpf.git" }
 
-# Or with specific features
+# With specific features
 axebpf = { git = "https://github.com/Iscreamx/axebpf.git", features = ["tracepoint-support", "runtime"] }
+
+# With probe support
+axebpf = { git = "https://github.com/Iscreamx/axebpf.git", features = ["hprobe", "guest-kprobe"] }
 ```
 
 ### Feature Flags
@@ -88,8 +110,11 @@ axebpf = { git = "https://github.com/Iscreamx/axebpf.git", features = ["tracepoi
 |---------|-------------|--------------|
 | `symbols` | Symbol table support | `ksym` |
 | `tracepoint-support` | Tracepoint framework | `symbols`, `tracepoint`, `tp-lexer`, `spin`, `static-keys` |
-| `runtime` | eBPF VM and maps | `rbpf`, `kbpf-basic`, `spin` |
+| `runtime` | eBPF VM, ELF loader, maps | `rbpf`, `kbpf-basic`, `aya-obj`, `hashbrown`, `spin` |
 | `axhal` | Real kernel platform ops | `axhal` |
+| `precompiled-ebpf` | Embed pre-compiled eBPF .o files | (none) |
+| `hprobe` | VMM self-introspection probes | `tracepoint-support`, `kprobe` |
+| `guest-kprobe` | Guest kernel probing | `hprobe` |
 
 **Default features:** `symbols`, `tracepoint-support`, `runtime`, `axhal`
 
@@ -121,52 +146,42 @@ for tp in mgr.list_tracepoints() {
 mgr.enable("vmm:vm_create").unwrap();
 ```
 
+## Probe Types
+
+axebpf supports three probing mechanisms at different privilege levels:
+
+| Probe | Target | Mechanism | Feature |
+|-------|--------|-----------|---------|
+| Hprobe | VMM functions (EL2) | BRK instruction patching + instruction slot single-step | `hprobe` |
+| Guest Kprobe | Guest kernel (EL1) | Stage-2 XN fault or BRK injection into guest memory | `guest-kprobe` |
+| Tracepoint | VMM static points | Compile-time instrumentation via `static-keys` | `tracepoint-support` |
+
 ## Defined Tracepoints
 
 ### VM Lifecycle
-- `vmm:vm_create` - VM creation
-- `vmm:vm_boot` - VM boot sequence
-- `vmm:vm_shutdown` - VM shutdown
-- `vmm:vm_destroy` - VM destruction
+- `vmm:vm_create` / `vmm:vm_boot` / `vmm:vm_shutdown` / `vmm:vm_destroy`
 
 ### vCPU Lifecycle
-- `vmm:vcpu_create` - vCPU creation
-- `vmm:vcpu_destroy` - vCPU destruction
-- `vmm:vcpu_state_change` - vCPU state transitions
+- `vmm:vcpu_create` / `vmm:vcpu_destroy` / `vmm:vcpu_state_change`
 
 ### vCPU Runtime
-- `vmm:vcpu_run_enter` - VM entry
-- `vmm:vcpu_run_exit` - VM exit
-- `vmm:hypercall` - Hypercall handling
-- `vmm:external_interrupt` - External interrupt
-- `vmm:vcpu_halt` - vCPU halt
-- `vmm:cpu_up` - Secondary CPU boot
-- `vmm:ipi_send` - IPI sending
+- `vmm:vcpu_run_enter` / `vmm:vcpu_run_exit` / `vmm:hypercall`
+- `vmm:external_interrupt` / `vmm:vcpu_halt` / `vmm:cpu_up` / `vmm:ipi_send`
 
 ### Memory Management
-- `vmm:memory_map` - Memory mapping
-- `vmm:memory_unmap` - Memory unmapping
-- `vmm:page_fault` - Page fault handling
+- `vmm:memory_map` / `vmm:memory_unmap` / `vmm:page_fault`
 
 ### Device & IRQ
-- `vmm:device_access` - Device MMIO access
-- `vmm:irq_inject` - Interrupt injection
-- `vmm:irq_handle` - Interrupt handling
+- `vmm:device_access` / `vmm:irq_inject` / `vmm:irq_handle`
 
 ### System Initialization
-- `vmm:vmm_init` - VMM initialization
-- `vmm:vhal_init` - VHal initialization
-- `vmm:config_load` - Configuration loading
-- `vmm:image_load` - Image loading
+- `vmm:vmm_init` / `vmm:vhal_init` / `vmm:config_load` / `vmm:image_load`
 
 ### Shell
-- `shell:shell_init` - Shell initialization
-- `shell:shell_command` - Shell command execution
+- `shell:shell_init` / `shell:shell_command`
 
 ### Timer
-- `vmm:timer_tick` - Timer tick
-- `vmm:timer_event` - Timer event
-- `vmm:task_switch` - Task context switch
+- `vmm:timer_tick` / `vmm:timer_event` / `vmm:task_switch`
 
 ## eBPF Helpers
 
@@ -188,6 +203,17 @@ mgr.enable("vmm:vm_create").unwrap();
 | 100 | `bpf_get_current_vm_id` | Get current VM ID |
 | 101 | `bpf_get_current_vcpu_id` | Get current vCPU ID |
 | 102 | `bpf_get_exit_reason` | Get VM exit reason |
+
+## ELF Loading
+
+The runtime uses `aya-obj` for ELF parsing and relocation, supporting:
+
+- **Map relocation** (`R_BPF_64_64`) - Patches `ld_imm64` instructions with map FDs
+- **Call relocation** (`R_BPF_64_32`) - Links BPF-to-BPF function calls (memcpy/memmove/memset)
+- **`.text` section merging** - Compiler-generated helpers are merged into program bytecode
+- **BTF and legacy map sections** - Both map definition formats supported
+
+ELF data from `include_bytes!()` is automatically copied to an aligned buffer when needed (aarch64 requires 8-byte alignment for ELF header parsing).
 
 ## Architecture
 
