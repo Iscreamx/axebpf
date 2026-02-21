@@ -21,6 +21,47 @@ const KPROBES_BRK_SS_IMM: u64 = 0x006; // Single-step complete (BRK #6)
 /// Layout: gpr[31] (248B) + sp_el0 (8B) + elr (8B) + spsr (8B) = 272B.
 const TRAPFRAME_COMPAT_SIZE: usize = 272;
 
+#[inline]
+fn probe_pc(pt_regs: &kprobe::PtRegs) -> usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return pt_regs.pc as usize;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // On x86_64, INT3 advances RIP by 1, so the probe point is RIP - 1.
+        return pt_regs.rip.saturating_sub(1);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = pt_regs;
+        0
+    }
+}
+
+#[inline]
+fn arg_at(pt_regs: &kprobe::PtRegs, idx: usize) -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return pt_regs.regs[idx];
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        return match idx {
+            0 => pt_regs.rdi as u64,
+            1 => pt_regs.rsi as u64,
+            2 => pt_regs.rdx as u64,
+            3 => pt_regs.rcx as u64,
+            _ => 0,
+        };
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = (pt_regs, idx);
+        0
+    }
+}
+
 /// Handle BRK (breakpoint) exception from current EL.
 ///
 /// Called from arm_vcpu exception handler when EC == BRK64.
@@ -93,30 +134,33 @@ fn handle_brk_main(pt_regs: &mut kprobe::PtRegs) -> bool {
     let reg = match registry.as_mut() {
         Some(r) => r,
         None => {
-            log::warn!("handle_brk_main: registry not initialized, BRK at pc={:#x}", pt_regs.pc);
+            log::warn!(
+                "handle_brk_main: registry not initialized, BRK at pc={:#x}",
+                probe_pc(pt_regs)
+            );
             return false;
         }
     };
 
-    let probe_addr = pt_regs.pc as usize;
+    let probe_addr = probe_pc(pt_regs);
     let result = kprobe::kprobe_handler_from_break(reg.manager_mut(), pt_regs);
 
     if result.is_some() {
-        reg.record_hit(probe_addr);
+        let (entry_hit, _ret_hit) = reg.record_break_hit(probe_addr);
         log::debug!("handle_brk_main: hit recorded at {:#x}", probe_addr);
 
         #[cfg(all(feature = "runtime", feature = "tracepoint-support"))]
-        {
+        if entry_hit {
             let mut event = crate::event::TraceEvent::new(
                 crate::event::PROBE_HPROBE,
                 probe_addr as u32,
             );
             event.name_offset = crate::event::register_event_name("hprobe");
             event.nr_args = 4;
-            event.args[0] = pt_regs.regs[0];
-            event.args[1] = pt_regs.regs[1];
-            event.args[2] = pt_regs.regs[2];
-            event.args[3] = pt_regs.regs[3];
+            event.args[0] = arg_at(pt_regs, 0);
+            event.args[1] = arg_at(pt_regs, 1);
+            event.args[2] = arg_at(pt_regs, 2);
+            event.args[3] = arg_at(pt_regs, 3);
             crate::event::emit_event(&event);
         }
 
