@@ -121,9 +121,10 @@ fn parse_elf_with_aya(
             2 => crate::maps::MapType::Array,      // BPF_MAP_TYPE_ARRAY
             9 => crate::maps::MapType::LruHash,    // BPF_MAP_TYPE_LRU_HASH
             22 => crate::maps::MapType::Queue,     // BPF_MAP_TYPE_QUEUE
+            27 => crate::maps::MapType::RingBuf,   // BPF_MAP_TYPE_RINGBUF
             unsupported => {
                 log::warn!(
-                    "map '{}': unsupported BPF map type {} (only Hash=1, Array=2, LRU=9, Queue=22 are supported)",
+                    "map '{}': unsupported BPF map type {} (supported: Hash=1, Array=2, LRU=9, Queue=22, RingBuf=27)",
                     name, unsupported
                 );
                 // Cleanup already created maps

@@ -253,3 +253,27 @@ pub fn list_all() -> Vec<(u32, u64, Option<String>, u64, bool, bool, u32, Kprobe
         None => Vec::new(),
     }
 }
+
+/// Look up an enabled probe and return `(prog_id, is_ret)`.
+pub fn lookup_enabled(vm_id: u32, gva: u64) -> Option<(u32, bool)> {
+    let registry = GUEST_KPROBE_REGISTRY.lock();
+    let registry = registry.as_ref()?;
+    let entry = registry.lookup(vm_id, gva)?;
+    if entry.state != GuestKprobeState::Enabled {
+        return None;
+    }
+    Some((entry.prog_id, entry.is_ret))
+}
+
+/// Record one hit for an enabled probe.
+pub fn record_probe_hit(vm_id: u32, gva: u64) -> bool {
+    let mut registry = GUEST_KPROBE_REGISTRY.lock();
+    let Some(registry) = registry.as_mut() else {
+        return false;
+    };
+    if registry.lookup(vm_id, gva).is_none() {
+        return false;
+    }
+    registry.record_hit(vm_id, gva);
+    true
+}

@@ -87,21 +87,30 @@ impl KernelAuxiliaryOps for AxKernelAuxOps {
     }
 
     fn alloc_page() -> Result<usize> {
-        // RingBuf not supported in this phase
-        Err(BpfError::NotSupported)
+        let page_size = 0x1000;
+        let vaddr = axalloc::global_allocator()
+            .alloc_pages(1, page_size, axalloc::UsageKind::VirtMem)
+            .map_err(|_| BpfError::NoSpace)?;
+        // Zero the page
+        unsafe { core::ptr::write_bytes(vaddr as *mut u8, 0, page_size); }
+        // Convert VA to PA for kbpf-basic
+        let paddr = axhal::mem::virt_to_phys((vaddr).into()).as_usize();
+        log::debug!("alloc_page: vaddr={:#x} paddr={:#x}", vaddr, paddr);
+        Ok(paddr)
     }
 
-    fn free_page(_phys_addr: usize) {
-        // RingBuf not supported in this phase
+    fn free_page(phys_addr: usize) {
+        let vaddr = axhal::mem::phys_to_virt((phys_addr).into()).as_usize();
+        axalloc::global_allocator().dealloc_pages(vaddr, 1, axalloc::UsageKind::VirtMem);
+        log::debug!("free_page: paddr={:#x} vaddr={:#x}", phys_addr, vaddr);
     }
 
-    fn vmap(_phys_addrs: &[usize]) -> Result<usize> {
-        // RingBuf not supported in this phase
-        Err(BpfError::NotSupported)
+    fn vmap(phys_addrs: &[usize]) -> Result<usize> {
+        crate::vmap::vmap(phys_addrs).ok_or(BpfError::NoSpace)
     }
 
-    fn unmap(_vaddr: usize) {
-        // RingBuf not supported in this phase
+    fn unmap(vaddr: usize) {
+        crate::vmap::unmap(vaddr);
     }
 }
 
@@ -217,5 +226,38 @@ impl PerCpuVariantsOps for DummyPerCpuOps {
     fn num_cpus() -> u32 {
         // Return 1 as fallback
         1
+    }
+}
+
+// =============================================================================
+// PollWaker for RingBuf
+// =============================================================================
+
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
+use kbpf_basic::PollWaker;
+
+/// Simple PollWaker that sets an atomic flag when data is available.
+/// Used by `trace stream` to detect new events.
+pub struct TracePollWaker {
+    has_data: AtomicBool,
+}
+
+impl TracePollWaker {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            has_data: AtomicBool::new(false),
+        })
+    }
+
+    /// Check and clear the data-available flag.
+    pub fn check_and_clear(&self) -> bool {
+        self.has_data.swap(false, Ordering::AcqRel)
+    }
+}
+
+impl PollWaker for TracePollWaker {
+    fn wake_up(&self) {
+        self.has_data.store(true, Ordering::Release);
     }
 }

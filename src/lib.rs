@@ -88,6 +88,12 @@ pub mod tracepoints;
 pub mod map_ops;
 
 #[cfg(feature = "runtime")]
+pub mod vmap;
+
+#[cfg(all(feature = "runtime", feature = "tracepoint-support"))]
+pub mod event;
+
+#[cfg(feature = "runtime")]
 pub mod maps;
 
 #[cfg(feature = "runtime")]
@@ -126,6 +132,12 @@ pub use attach::{AttachmentInfo, is_verbose, set_verbose};
 
 #[cfg(feature = "runtime")]
 pub use output::{print_ebpf_result, print_if_verbose};
+
+#[cfg(all(feature = "runtime", feature = "tracepoint-support"))]
+pub use event::{
+    TraceEvent, all_stats, consume_events, emit_event, event_name_for_id, get_event_name,
+    init_ringbuf, init_ringbuf_with_size, register_event_name,
+};
 
 #[cfg(feature = "hprobe")]
 pub use kprobe::PtRegs;
@@ -167,12 +179,14 @@ pub fn init() {
     #[cfg(feature = "runtime")]
     {
         info!("  - runtime module enabled");
-        info!("    - maps: Array, HashMap, LRU, Queue");
+        info!("    - maps: Array, HashMap, LRU, Queue, RingBuf");
         info!(
             "    - helpers: {} standard functions",
             helpers::SUPPORTED_HELPERS.len()
         );
         runtime::init();
+        #[cfg(feature = "tracepoint-support")]
+        event::init_ringbuf();
     }
 
     info!("axebpf initialization complete");
@@ -234,12 +248,14 @@ pub fn init_with_symbols(kallsyms_data: &'static [u8], stext: u64, etext: u64) {
     #[cfg(feature = "runtime")]
     {
         info!("  - runtime module enabled");
-        info!("    - maps: Array, HashMap, LRU, Queue");
+        info!("    - maps: Array, HashMap, LRU, Queue, RingBuf");
         info!(
             "    - helpers: {} standard functions",
             helpers::SUPPORTED_HELPERS.len()
         );
         runtime::init();
+        #[cfg(feature = "tracepoint-support")]
+        event::init_ringbuf();
     }
 
     info!("axebpf initialization complete");

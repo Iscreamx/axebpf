@@ -9,8 +9,8 @@ use spin::Mutex;
 
 /// Static buffer for returning lookup results.
 /// Linux BPF returns a pointer to map-internal storage; we simulate this
-/// with a static buffer. Max value size supported: 256 bytes.
-pub const MAX_VALUE_SIZE: usize = 256;
+/// with a static buffer. Max value size supported: 512 bytes.
+pub const MAX_VALUE_SIZE: usize = 512;
 static LOOKUP_BUFFER: Mutex<[u8; MAX_VALUE_SIZE]> = Mutex::new([0u8; MAX_VALUE_SIZE]);
 
 /// Static buffer for returning tracepoint names.
@@ -62,6 +62,9 @@ pub mod id {
     pub const GET_SMP_PROCESSOR_ID: u32 = 8;
     /// bpf_get_tracepoint_name(tracepoint_id) -> name_ptr or 0
     pub const GET_TRACEPOINT_NAME: u32 = 10;
+    /// bpf_probe_read_kernel(dst, size, src) -> 0 or error
+    /// Same semantics as PROBE_READ, but uses the Linux kernel helper ID.
+    pub const PROBE_READ_KERNEL: u32 = 113;
 }
 
 // =============================================================================
@@ -258,6 +261,7 @@ pub fn get_helper(id: u32) -> Option<HelperFn> {
         id::TRACE_PRINTK => Some(bpf_trace_printk),
         id::GET_SMP_PROCESSOR_ID => Some(bpf_get_smp_processor_id),
         id::GET_TRACEPOINT_NAME => Some(bpf_get_tracepoint_name),
+        id::PROBE_READ_KERNEL => Some(bpf_probe_read),
         _ => None,
     }
 }
@@ -272,6 +276,7 @@ pub const SUPPORTED_HELPERS: &[u32] = &[
     id::TRACE_PRINTK,
     id::GET_SMP_PROCESSOR_ID,
     id::GET_TRACEPOINT_NAME,
+    id::PROBE_READ_KERNEL,
 ];
 
 /// Register all standard helpers to an rbpf VM.

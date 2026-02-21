@@ -58,10 +58,41 @@ pub fn execute_attached_program(tracepoint_name: &str, timestamp: u64, duration_
 
 /// Record a hit for a tracepoint (executes attached eBPF program).
 pub fn record_hit(name: &str, timestamp: u64) {
-    execute_attached_program(name, timestamp, 0);
+    #[cfg(feature = "runtime")]
+    {
+        let tp_id = registry::get_id(name).unwrap_or(0);
+        let name_offset = crate::event::register_event_name(name);
+
+        let mut event = crate::event::TraceEvent::new(crate::event::PROBE_TRACEPOINT, tp_id);
+        event.timestamp_ns = timestamp;
+        event.name_offset = name_offset;
+
+        crate::event::emit_event(&event);
+    }
+
+    #[cfg(not(feature = "runtime"))]
+    {
+        execute_attached_program(name, timestamp, 0);
+    }
 }
 
 /// Record a duration for a tracepoint (executes attached eBPF program).
 pub fn record_duration(name: &str, timestamp: u64, duration_ns: u64) {
-    execute_attached_program(name, timestamp, duration_ns);
+    #[cfg(feature = "runtime")]
+    {
+        let tp_id = registry::get_id(name).unwrap_or(0);
+        let name_offset = crate::event::register_event_name(name);
+
+        let mut event = crate::event::TraceEvent::new(crate::event::PROBE_TRACEPOINT, tp_id);
+        event.timestamp_ns = timestamp;
+        event.duration_ns = duration_ns;
+        event.name_offset = name_offset;
+
+        crate::event::emit_event(&event);
+    }
+
+    #[cfg(not(feature = "runtime"))]
+    {
+        execute_attached_program(name, timestamp, duration_ns);
+    }
 }

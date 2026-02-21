@@ -92,7 +92,10 @@ fn handle_brk_main(pt_regs: &mut kprobe::PtRegs) -> bool {
     let mut registry = KPROBE_REGISTRY.lock();
     let reg = match registry.as_mut() {
         Some(r) => r,
-        None => return false,
+        None => {
+            log::warn!("handle_brk_main: registry not initialized, BRK at pc={:#x}", pt_regs.pc);
+            return false;
+        }
     };
 
     let probe_addr = pt_regs.pc as usize;
@@ -100,8 +103,26 @@ fn handle_brk_main(pt_regs: &mut kprobe::PtRegs) -> bool {
 
     if result.is_some() {
         reg.record_hit(probe_addr);
+        log::debug!("handle_brk_main: hit recorded at {:#x}", probe_addr);
+
+        #[cfg(all(feature = "runtime", feature = "tracepoint-support"))]
+        {
+            let mut event = crate::event::TraceEvent::new(
+                crate::event::PROBE_HPROBE,
+                probe_addr as u32,
+            );
+            event.name_offset = crate::event::register_event_name("hprobe");
+            event.nr_args = 4;
+            event.args[0] = pt_regs.regs[0];
+            event.args[1] = pt_regs.regs[1];
+            event.args[2] = pt_regs.regs[2];
+            event.args[3] = pt_regs.regs[3];
+            crate::event::emit_event(&event);
+        }
+
         true
     } else {
+        log::warn!("handle_brk_main: no probe found for pc={:#x}", probe_addr);
         false
     }
 }

@@ -22,6 +22,8 @@ pub enum MapType {
     LruHash,
     /// FIFO queue.
     Queue,
+    /// Ring buffer for event streaming (key_size=0, value_size=0).
+    RingBuf,
 }
 
 /// Map definition for creating new maps.
@@ -86,6 +88,7 @@ fn to_bpf_map_type(map_type: MapType) -> BpfMapType {
         MapType::HashMap => BpfMapType::BPF_MAP_TYPE_HASH,
         MapType::LruHash => BpfMapType::BPF_MAP_TYPE_LRU_HASH,
         MapType::Queue => BpfMapType::BPF_MAP_TYPE_QUEUE,
+        MapType::RingBuf => BpfMapType::BPF_MAP_TYPE_RINGBUF,
     }
 }
 
@@ -110,10 +113,15 @@ fn to_bpf_map_meta(def: &MapDef) -> BpfMapMeta {
 pub fn create(def: &MapDef) -> Result<u32, Error> {
     let meta = to_bpf_map_meta(def);
 
-    // Create the map using kbpf-basic
-    // No PollWaker needed for basic map types (only RingBuf needs it)
+    // RingBuf requires a PollWaker
+    let poll_waker = if def.map_type == MapType::RingBuf {
+        Some(crate::map_ops::TracePollWaker::new() as alloc::sync::Arc<dyn kbpf_basic::PollWaker>)
+    } else {
+        None
+    };
+
     let unified_map =
-        bpf_map_create::<AxKernelAuxOps, DummyPerCpuOps>(meta, None).map_err(Error::from)?;
+        bpf_map_create::<AxKernelAuxOps, DummyPerCpuOps>(meta, poll_waker).map_err(Error::from)?;
 
     let id = register_map(unified_map);
     log::debug!("Created map {} with type {:?}", id, def.map_type);

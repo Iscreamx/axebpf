@@ -9,7 +9,7 @@ authors = ["iscreamx404@gmail.com"]
 default = ["symbols", "tracepoint-support", "runtime", "axhal"]
 symbols = ["ksym"]
 tracepoint-support = ["symbols", "dep:tracepoint", "tp-lexer", "spin", "static-keys"]
-runtime = ["rbpf", "kbpf-basic", "spin", "dep:aya-obj", "dep:hashbrown"]
+runtime = ["rbpf", "kbpf-basic", "spin", "dep:aya-obj", "dep:hashbrown", "dep:axalloc"]
 axhal = ["dep:axhal"]
 precompiled-ebpf = []
 hprobe = ["tracepoint-support", "dep:kprobe"]
@@ -39,6 +39,9 @@ hashbrown = { version = "0.16", default-features = false, optional = true }
 
 # kprobe feature
 kprobe = { git = "https://github.com/Starry-OS/kprobe.git", optional = true }
+
+# allocator (for RingBuf page allocation)
+axalloc = { workspace = true, optional = true }
 
 [dev-dependencies]
 # For testing in user space (no kernel dependencies needed)

@@ -54,6 +54,16 @@ pub fn init(data: &'static [u8], stext: u64, etext: u64) -> Result<(), Error> {
         return Err(Error::AlreadyInitialized);
     }
 
+    // Diagnostic: read num_syms from blob header to verify injection
+    if data.len() >= 8 {
+        let num_syms = u64::from_le_bytes(data[..8].try_into().unwrap());
+        log::info!("    - blob header: num_syms={}", num_syms);
+        if num_syms == 0 {
+            log::warn!("    - kallsyms blob appears empty (num_syms=0)");
+            log::warn!("    - run 'cargo xtask build' to inject symbols into the binary");
+        }
+    }
+
     let table = KallsymsMapped::from_blob(data, stext, etext).map_err(Error::ParseError)?;
 
     unsafe {

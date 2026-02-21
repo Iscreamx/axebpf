@@ -7,7 +7,7 @@
 use crate::trace_ops::AxKops;
 use crate::tracepoint::KernelTraceOps;
 
-use super::stats::execute_attached_program;
+use super::stats::record_duration;
 
 // =============================================================================
 // Shell Tracepoints (internal module to avoid name collision)
@@ -52,9 +52,10 @@ pub fn trace_shell_command(cmd_id: u32, duration_ns: u64) {
     // Trigger the tracepoint macro
     internal::trace_shell_command(cmd_id, duration_ns);
 
-    // Execute attached eBPF program
+    // Route through the unified stats/event pipeline
     let timestamp = AxKops::time_now();
-    execute_attached_program("shell:shell_command", timestamp, duration_ns);
+    let _ = cmd_id; // keep API stable for existing call sites
+    record_duration("shell:shell_command", timestamp, duration_ns);
 }
 
 /// Trace shell initialization.
@@ -64,7 +65,7 @@ pub fn trace_shell_init(duration_ns: u64) {
     // Trigger the tracepoint macro
     internal::trace_shell_init(duration_ns);
 
-    // Execute attached eBPF program
+    // Route through the unified stats/event pipeline
     let timestamp = AxKops::time_now();
-    execute_attached_program("shell:shell_init", timestamp, duration_ns);
+    record_duration("shell:shell_init", timestamp, duration_ns);
 }
