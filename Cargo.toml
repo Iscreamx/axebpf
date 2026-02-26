@@ -14,6 +14,7 @@ axhal = ["dep:axhal"]
 precompiled-ebpf = []
 hprobe = ["tracepoint-support", "dep:kprobe"]
 guest-kprobe = ["hprobe"]
+test-utils = []
 
 [dependencies]
 log = "0.4"

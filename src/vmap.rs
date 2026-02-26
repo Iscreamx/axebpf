@@ -4,26 +4,35 @@
 //! virtual address range in the EL2 Stage-1 page table (TTBR0_EL2).
 //! AArch64 only.
 
+#[cfg(target_arch = "aarch64")]
 use alloc::vec::Vec;
+#[cfg(target_arch = "aarch64")]
 use core::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(target_arch = "aarch64")]
 use spin::Mutex;
 
+#[cfg(target_arch = "aarch64")]
 const PAGE_SIZE: usize = 0x1000;
 
 /// Base VA for vmap region.
 ///
 /// Keep this in the same lower-half VA space used by the current EL2 kernel
 /// mappings. Using a high-half address here can fault before TTBR1 is active.
+#[cfg(target_arch = "aarch64")]
 const VMAP_BASE: usize = 0x0000_F900_0000_0000;
+#[cfg(target_arch = "aarch64")]
 const VMAP_SIZE: usize = 0x0000_0100_0000_0000; // 1TB vmap region
 
 /// Bump allocator for VA space
+#[cfg(target_arch = "aarch64")]
 static VMAP_NEXT: AtomicUsize = AtomicUsize::new(VMAP_BASE);
 
 /// Track active mappings for unmap: (vaddr, page_count)
+#[cfg(target_arch = "aarch64")]
 static VMAP_REGIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
 // AArch64 page table constants
+#[cfg(target_arch = "aarch64")]
 mod pte {
     pub const VALID: u64 = 1 << 0;
     pub const TABLE: u64 = 1 << 1;       // table descriptor (L0-L2)
@@ -42,6 +51,7 @@ mod pte {
 }
 
 /// Read TTBR0_EL2 to get page table root physical address
+#[cfg(target_arch = "aarch64")]
 fn page_table_root_phys() -> u64 {
     let ttbr: u64;
     unsafe {
@@ -50,15 +60,18 @@ fn page_table_root_phys() -> u64 {
     ttbr & pte::ADDR_MASK
 }
 
+#[cfg(target_arch = "aarch64")]
 fn phys_to_virt(paddr: u64) -> usize {
     axhal::mem::phys_to_virt((paddr as usize).into()).as_usize()
 }
 
+#[cfg(target_arch = "aarch64")]
 fn virt_to_phys(vaddr: usize) -> u64 {
     axhal::mem::virt_to_phys((vaddr).into()).as_usize() as u64
 }
 
 /// Flush all EL2 TLB entries (inner shareable domain)
+#[cfg(target_arch = "aarch64")]
 fn flush_tlb() {
     unsafe {
         core::arch::asm!(
@@ -72,6 +85,7 @@ fn flush_tlb() {
 }
 
 /// Allocate a zeroed physical page and return its physical address.
+#[cfg(target_arch = "aarch64")]
 fn alloc_table_page() -> Option<u64> {
     let vaddr = axalloc::global_allocator()
         .alloc_pages(1, PAGE_SIZE, axalloc::UsageKind::PageTable)
@@ -85,6 +99,7 @@ fn alloc_table_page() -> Option<u64> {
 /// `index` is the entry index within this table (0..511).
 /// If the entry is not valid, allocates a new table page.
 /// Returns the physical address of the next-level table.
+#[cfg(target_arch = "aarch64")]
 fn get_or_create_table(table_paddr: u64, index: usize) -> Option<u64> {
     let table_vaddr = phys_to_virt(table_paddr);
     let entry_ptr = (table_vaddr + index * 8) as *mut u64;
@@ -108,6 +123,7 @@ fn get_or_create_table(table_paddr: u64, index: usize) -> Option<u64> {
 }
 
 /// Install an L3 page entry mapping `vaddr` -> `paddr`.
+#[cfg(target_arch = "aarch64")]
 fn map_page(vaddr: usize, paddr: usize) -> bool {
     let root_paddr = page_table_root_phys();
 
@@ -141,6 +157,7 @@ fn map_page(vaddr: usize, paddr: usize) -> bool {
 }
 
 /// Unmap a single page by clearing its L3 PTE.
+#[cfg(target_arch = "aarch64")]
 fn unmap_page(vaddr: usize) {
     let root_paddr = page_table_root_phys();
 
@@ -174,6 +191,7 @@ fn unmap_page(vaddr: usize) {
 /// twice for wrap-around zero-copy reads).
 ///
 /// Returns the starting virtual address of the mapped region.
+#[cfg(target_arch = "aarch64")]
 pub fn vmap(phys_addrs: &[usize]) -> Option<usize> {
     let nr_pages = phys_addrs.len();
     if nr_pages == 0 {
@@ -215,6 +233,7 @@ pub fn vmap(phys_addrs: &[usize]) -> Option<usize> {
 }
 
 /// Unmap a previously vmapped region.
+#[cfg(target_arch = "aarch64")]
 pub fn unmap(vaddr: usize) {
     let nr_pages = {
         let mut regions = VMAP_REGIONS.lock();
@@ -239,3 +258,11 @@ pub fn unmap(vaddr: usize) {
 
     log::info!("unmap: unmapped {} pages at {:#x}", nr_pages, vaddr);
 }
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn vmap(_phys_addrs: &[usize]) -> Option<usize> {
+    None
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn unmap(_vaddr: usize) {}

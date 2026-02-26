@@ -22,6 +22,30 @@ fn emit_guest_event(vm_id: u32, pc_or_gva: u64, is_ret: bool, args: [u64; 4]) {
     crate::event::emit_event(&event);
 }
 
+#[cfg(feature = "runtime")]
+fn build_guest_ctx(vm_id: u32, is_ret: bool, a0: u64, a1: u64) -> crate::TraceContext {
+    let probe_type = if is_ret { 3 } else { 2 };
+    crate::TraceContext::new(0)
+        .with_vm(vm_id, 0)
+        .with_args(a0, a1, 0, 0)
+        .with_probe_type(probe_type)
+}
+
+#[cfg(all(feature = "runtime", feature = "guest-kprobe"))]
+pub fn build_guest_ctx_for_test(vm_id: u32, is_ret: bool, a0: u64, a1: u64) -> crate::TraceContext {
+    build_guest_ctx(vm_id, is_ret, a0, a1)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestBrkHandleResult {
+    /// The BRK came from an enabled probe, and caller should advance PC.
+    ProbeHit,
+    /// The BRK was stale after detach; caller should retry at current PC.
+    RetryInstruction,
+    /// Not a guest-kprobe BRK.
+    Unhandled,
+}
+
 /// Handle a Stage-2 permission fault that may be a guest kprobe.
 ///
 /// Called from the Stage-2 fault handler in the vCPU exit path.
@@ -52,8 +76,10 @@ pub fn handle_stage2_exec_fault(
 
         #[cfg(feature = "runtime")]
         {
-            // Guest register context plumbing is not ready yet; execute with empty ctx.
-            let _ = crate::runtime::run_program(prog_id, None);
+            let mut ctx = build_guest_ctx(vm_id, is_ret, gva, gpa);
+            crate::tracepoints::hypervisor_helpers::set_current_context(vm_id, 0, 0);
+            let _ = crate::runtime::run_program(prog_id, Some(ctx.as_bytes_mut()));
+            crate::tracepoints::hypervisor_helpers::clear_current_context();
         }
 
         log::debug!(
@@ -62,6 +88,7 @@ pub fn handle_stage2_exec_fault(
             gva,
             prog_id
         );
+        return true;
     }
 
     log::trace!(
@@ -69,7 +96,7 @@ pub fn handle_stage2_exec_fault(
         vm_id, gpa, gva
     );
 
-    false // Not handled yet
+    false
 }
 
 /// Handle a guest BRK exception routed to EL2 (for BRK inject mode).
@@ -80,12 +107,12 @@ pub fn handle_stage2_exec_fault(
 /// * `iss` - Instruction Specific Syndrome
 ///
 /// # Returns
-/// `true` if handled as a guest kprobe, `false` if not.
+/// Handling decision for the caller.
 pub fn handle_guest_brk(
     vm_id: u32,
     pc: u64,
     iss: u64,
-) -> bool {
+) -> GuestBrkHandleResult {
     if let Some((prog_id, is_ret)) = super::manager::lookup_enabled(vm_id, pc) {
         let _ = super::manager::record_probe_hit(vm_id, pc);
 
@@ -94,8 +121,10 @@ pub fn handle_guest_brk(
 
         #[cfg(feature = "runtime")]
         {
-            // Guest register context plumbing is not ready yet; execute with empty ctx.
-            let _ = crate::runtime::run_program(prog_id, None);
+            let mut ctx = build_guest_ctx(vm_id, is_ret, pc, iss);
+            crate::tracepoints::hypervisor_helpers::set_current_context(vm_id, 0, 0);
+            let _ = crate::runtime::run_program(prog_id, Some(ctx.as_bytes_mut()));
+            crate::tracepoints::hypervisor_helpers::clear_current_context();
         }
 
         log::debug!(
@@ -104,6 +133,12 @@ pub fn handle_guest_brk(
             pc,
             prog_id
         );
+        return GuestBrkHandleResult::ProbeHit;
+    }
+
+    if super::manager::consume_stale_brk(vm_id, pc) {
+        log::debug!("guest_kprobe: recovered stale BRK vm{} pc={:#x}", vm_id, pc);
+        return GuestBrkHandleResult::RetryInstruction;
     }
 
     log::trace!(
@@ -111,5 +146,5 @@ pub fn handle_guest_brk(
         vm_id, pc, iss
     );
 
-    false // Not handled yet
+    GuestBrkHandleResult::Unhandled
 }

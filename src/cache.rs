@@ -32,15 +32,23 @@ pub fn flush_icache_range(start: usize, end: usize) {
 
         for addr in (start_aligned..end).step_by(CACHE_LINE_SIZE) {
             core::arch::asm!(
-                "ic ivau, {0}",     // Invalidate instruction cache
+                "ic ivau, {0}",     // Invalidate local instruction cache lines
                 in(reg) addr,
                 options(nostack, preserves_flags)
             );
         }
 
         core::arch::asm!(
-            "dsb ish",              // Ensure IC invalidation complete
-            "isb",                  // Instruction synchronization
+            "dsb ish",              // Ensure local IC invalidation complete
+            options(nostack, preserves_flags)
+        );
+
+        // Guest vCPUs may run on a different core than the shell command that patches text.
+        // Broadcast an inner-shareable I-cache invalidation so remote cores observe new instructions.
+        core::arch::asm!(
+            "ic ialluis",
+            "dsb ish",
+            "isb",
             options(nostack, preserves_flags)
         );
     }

@@ -22,6 +22,30 @@ pub static MAP_REGISTRY: Mutex<Vec<Option<UnifiedMap>>> = Mutex::new(Vec::new())
 /// Advanced features (RingBuf, PerCpu, Perf) return NotSupported.
 pub struct AxKernelAuxOps;
 
+#[inline]
+fn virt_to_phys(vaddr: usize) -> usize {
+    #[cfg(feature = "axhal")]
+    {
+        return axhal::mem::virt_to_phys(vaddr.into()).as_usize();
+    }
+    #[cfg(not(feature = "axhal"))]
+    {
+        vaddr
+    }
+}
+
+#[inline]
+fn phys_to_virt(paddr: usize) -> usize {
+    #[cfg(feature = "axhal")]
+    {
+        return axhal::mem::phys_to_virt(paddr.into()).as_usize();
+    }
+    #[cfg(not(feature = "axhal"))]
+    {
+        paddr
+    }
+}
+
 impl KernelAuxiliaryOps for AxKernelAuxOps {
     fn get_unified_map_from_ptr<F, R>(_ptr: *const u8, _func: F) -> Result<R>
     where
@@ -94,13 +118,13 @@ impl KernelAuxiliaryOps for AxKernelAuxOps {
         // Zero the page
         unsafe { core::ptr::write_bytes(vaddr as *mut u8, 0, page_size); }
         // Convert VA to PA for kbpf-basic
-        let paddr = axhal::mem::virt_to_phys((vaddr).into()).as_usize();
+        let paddr = virt_to_phys(vaddr);
         log::debug!("alloc_page: vaddr={:#x} paddr={:#x}", vaddr, paddr);
         Ok(paddr)
     }
 
     fn free_page(phys_addr: usize) {
-        let vaddr = axhal::mem::phys_to_virt((phys_addr).into()).as_usize();
+        let vaddr = phys_to_virt(phys_addr);
         axalloc::global_allocator().dealloc_pages(vaddr, 1, axalloc::UsageKind::VirtMem);
         log::debug!("free_page: paddr={:#x} vaddr={:#x}", phys_addr, vaddr);
     }
