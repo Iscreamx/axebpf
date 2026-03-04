@@ -56,13 +56,13 @@ pub mod symbols;
 #[cfg(feature = "tracepoint-support")]
 pub mod cache;
 
-#[cfg(feature = "tracepoint-support")]
+#[cfg(feature = "hprobe")]
 pub mod insn_slot;
 
 #[cfg(feature = "tracepoint-support")]
 pub mod page_table;
 
-#[cfg(feature = "hprobe")]
+#[cfg(any(feature = "hprobe", feature = "guest-kprobe"))]
 pub mod probe;
 
 #[cfg(feature = "tracepoint-support")]

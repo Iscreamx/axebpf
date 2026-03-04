@@ -13,7 +13,7 @@ runtime = ["rbpf", "kbpf-basic", "spin", "dep:aya-obj", "dep:hashbrown", "dep:ax
 axhal = ["dep:axhal"]
 precompiled-ebpf = []
 hprobe = ["tracepoint-support", "dep:kprobe"]
-guest-kprobe = ["hprobe"]
+guest-kprobe = ["tracepoint-support"]
 test-utils = []
 
 [dependencies]
