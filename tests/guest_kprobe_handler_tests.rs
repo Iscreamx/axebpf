@@ -4,6 +4,7 @@ use axebpf::probe::kprobe::{
     addr_translate::{register_guest_pt_read_hook, register_gva_to_hva_hook, register_vm_ttbr1_hook},
     handler,
     manager::{self, KprobeMode},
+    single_step,
 };
 use axerrno::AxResult;
 
@@ -50,7 +51,10 @@ fn setup_mock_backends() {
     register_gva_to_hva_hook(mock_gva_to_hva);
     manager::register_stage2_exec_hook(mock_stage2_exec);
     #[cfg(feature = "test-utils")]
-    manager::clear_stale_brk_for_test();
+    {
+        manager::clear_stale_brk_for_test();
+        single_step::clear_pending_for_test();
+    }
 }
 
 #[test]
@@ -80,11 +84,57 @@ fn guest_brk_match_must_return_true() {
     let handled = handler::handle_guest_brk(vm_id, pc, 0x123);
     assert_eq!(
         handled,
-        handler::GuestBrkHandleResult::ProbeHit,
-        "matched guest brk must be handled as active probe hit"
+        handler::GuestBrkHandleResult::ProbeHitSingleStep,
+        "matched guest brk must set up single-step"
     );
 
     manager::detach(vm_id, pc).unwrap();
+}
+
+#[test]
+fn guest_brk_single_step_setup_fail_must_fallback_skip() {
+    manager::init();
+    setup_mock_backends();
+    let vm_id = 11;
+    let pc = 0xffff_8000_8000_4000_u64;
+    let _ = manager::detach(vm_id, pc);
+
+    manager::attach(vm_id, pc, 4, false, KprobeMode::BrkInject).unwrap();
+    single_step::set_force_pending_fail_for_test(true);
+    let handled = handler::handle_guest_brk(vm_id, pc, 0x456);
+    single_step::set_force_pending_fail_for_test(false);
+    assert_eq!(
+        handled,
+        handler::GuestBrkHandleResult::ProbeHitFallbackSkip,
+        "single-step setup failure must fallback to legacy skip handling"
+    );
+
+    manager::detach(vm_id, pc).unwrap();
+}
+
+#[test]
+fn single_step_state_must_support_large_cpu_id() {
+    single_step::clear_pending_for_test();
+
+    let cpu = 4096usize;
+    let state = single_step::KprobeSingleStepState {
+        active: true,
+        probe_gva: 0x1000,
+        saved_insn: 0x1400_0000,
+        vm_id: 99,
+        hva: 0x2000,
+    };
+    single_step::set_pending(cpu, state).unwrap();
+    assert!(single_step::is_pending(cpu), "pending state must be recorded");
+
+    let recovered = single_step::take_pending(cpu).unwrap();
+    assert_eq!(recovered.probe_gva, state.probe_gva);
+    assert_eq!(recovered.saved_insn, state.saved_insn);
+    assert_eq!(recovered.vm_id, state.vm_id);
+    assert_eq!(recovered.hva, state.hva);
+    assert!(!single_step::is_pending(cpu), "pending state must be consumed");
+
+    single_step::clear_pending_for_test();
 }
 
 #[test]

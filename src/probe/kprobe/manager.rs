@@ -89,6 +89,15 @@ pub struct GuestKprobeRegistry {
     probes: BTreeMap<ProbeKey, GuestKprobeEntry>,
 }
 
+/// Atomic BRK probe hit context for single-step flow.
+#[derive(Clone, Copy, Debug)]
+pub struct BrkProbeHitInfo {
+    pub prog_id: u32,
+    pub is_ret: bool,
+    pub hva: usize,
+    pub saved_insn: u32,
+}
+
 impl GuestKprobeRegistry {
     pub fn new() -> Self {
         Self {
@@ -243,6 +252,14 @@ impl GuestKprobeRegistry {
         // Check VM-specific first, then global
         self.probes.get(&(vm_id, gva))
             .or_else(|| self.probes.get(&(0, gva)))
+    }
+
+    /// Mutable lookup with VM-specific entry preferred over global entry.
+    pub fn lookup_mut(&mut self, vm_id: u32, gva: u64) -> Option<&mut GuestKprobeEntry> {
+        if self.probes.contains_key(&(vm_id, gva)) {
+            return self.probes.get_mut(&(vm_id, gva));
+        }
+        self.probes.get_mut(&(0, gva))
     }
 
     /// Record a hit.
@@ -483,6 +500,27 @@ pub fn lookup_enabled(vm_id: u32, gva: u64) -> Option<(u32, bool)> {
     Some((entry.prog_id, entry.is_ret))
 }
 
+/// Look up an enabled BRK probe and record one hit in the same lock scope.
+pub fn lookup_enabled_brk_hit(vm_id: u32, gva: u64) -> Option<BrkProbeHitInfo> {
+    let mut registry = GUEST_KPROBE_REGISTRY.lock();
+    let registry = registry.as_mut()?;
+    let entry = registry.lookup_mut(vm_id, gva)?;
+    if entry.state != GuestKprobeState::Enabled || entry.mode != KprobeMode::BrkInject {
+        return None;
+    }
+    let (hva, saved_insn) = match (entry.resolved_hva, entry.saved_insn) {
+        (Some(hva), Some(insn)) => (hva, insn),
+        _ => return None,
+    };
+    entry.hits = entry.hits.saturating_add(1);
+    Some(BrkProbeHitInfo {
+        prog_id: entry.prog_id,
+        is_ret: entry.is_ret,
+        hva,
+        saved_insn,
+    })
+}
+
 /// Record one hit for an enabled probe.
 pub fn record_probe_hit(vm_id: u32, gva: u64) -> bool {
     let mut registry = GUEST_KPROBE_REGISTRY.lock();
@@ -494,4 +532,24 @@ pub fn record_probe_hit(vm_id: u32, gva: u64) -> bool {
     }
     registry.record_hit(vm_id, gva);
     true
+}
+
+/// Restore original instruction at probe point before single-step execution.
+pub fn restore_insn_for_step(hva: usize, saved_insn: u32) -> Result<(), &'static str> {
+    restore_guest_breakpoint(hva, saved_insn)
+}
+
+/// Re-inject BRK instruction at probe point after single-step completion.
+pub fn reinject_brk(hva: usize) -> Result<(), &'static str> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { core::ptr::write_volatile(hva as *mut u32, GUEST_BRK_INSN) };
+        crate::cache::flush_icache_range(hva, hva + core::mem::size_of::<u32>());
+        return Ok(());
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = hva;
+        Err("reinject_brk not supported on this architecture")
+    }
 }

@@ -38,8 +38,12 @@ pub fn build_guest_ctx_for_test(vm_id: u32, is_ret: bool, a0: u64, a1: u64) -> c
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestBrkHandleResult {
-    /// The BRK came from an enabled probe, and caller should advance PC.
-    ProbeHit,
+    /// The BRK came from an enabled probe. Caller should enable single-step
+    /// and keep PC unchanged so the restored instruction is executed.
+    ProbeHitSingleStep,
+    /// The BRK matched an enabled probe, but single-step setup failed.
+    /// Caller should fallback to legacy behavior and advance PC.
+    ProbeHitFallbackSkip,
     /// The BRK was stale after detach; caller should retry at current PC.
     RetryInstruction,
     /// Not a guest-kprobe BRK.
@@ -113,27 +117,49 @@ pub fn handle_guest_brk(
     pc: u64,
     iss: u64,
 ) -> GuestBrkHandleResult {
-    if let Some((prog_id, is_ret)) = super::manager::lookup_enabled(vm_id, pc) {
-        let _ = super::manager::record_probe_hit(vm_id, pc);
-
+    if let Some(hit) = super::manager::lookup_enabled_brk_hit(vm_id, pc) {
         #[cfg(all(feature = "runtime", feature = "tracepoint-support"))]
-        emit_guest_event(vm_id, pc, is_ret, [pc, iss, 0, 0]);
+        emit_guest_event(vm_id, pc, hit.is_ret, [pc, iss, 0, 0]);
 
         #[cfg(feature = "runtime")]
         {
-            let mut ctx = build_guest_ctx(vm_id, is_ret, pc, iss);
+            let mut ctx = build_guest_ctx(vm_id, hit.is_ret, pc, iss);
             crate::tracepoints::hypervisor_helpers::set_current_context(vm_id, 0, 0);
-            let _ = crate::runtime::run_program(prog_id, Some(ctx.as_bytes_mut()));
+            let _ = crate::runtime::run_program(hit.prog_id, Some(ctx.as_bytes_mut()));
             crate::tracepoints::hypervisor_helpers::clear_current_context();
         }
 
+        if let Err(e) = super::manager::restore_insn_for_step(hit.hva, hit.saved_insn) {
+            log::warn!("guest_kprobe: failed to restore insn for step: {}", e);
+            return GuestBrkHandleResult::ProbeHitFallbackSkip;
+        }
+
+        let cpu_id = crate::platform::cpu_id() as usize;
+        let state = super::single_step::KprobeSingleStepState {
+            active: true,
+            probe_gva: pc,
+            saved_insn: hit.saved_insn,
+            vm_id,
+            hva: hit.hva,
+        };
+        if let Err(e) = super::single_step::set_pending(cpu_id, state) {
+            log::warn!("guest_kprobe: failed to set single-step pending state: {}", e);
+            if let Err(reinject_err) = super::manager::reinject_brk(hit.hva) {
+                log::warn!(
+                    "guest_kprobe: failed to re-inject BRK after pending-state failure: {}",
+                    reinject_err
+                );
+            }
+            return GuestBrkHandleResult::ProbeHitFallbackSkip;
+        }
+
         log::debug!(
-            "guest_kprobe: matched guest BRK vm{} pc={:#x} prog_id={}",
+            "guest_kprobe: BRK hit vm{}:{:#x}, restored insn, pending single-step on cpu{}",
             vm_id,
             pc,
-            prog_id
+            cpu_id
         );
-        return GuestBrkHandleResult::ProbeHit;
+        return GuestBrkHandleResult::ProbeHitSingleStep;
     }
 
     if super::manager::consume_stale_brk(vm_id, pc) {
@@ -147,4 +173,31 @@ pub fn handle_guest_brk(
     );
 
     GuestBrkHandleResult::Unhandled
+}
+
+/// Handle SoftwareStepLowerEL exception for guest-kprobe single-step completion.
+///
+/// Returns `true` if the exception belongs to a pending kprobe single-step.
+pub fn handle_software_step() -> bool {
+    let cpu_id = crate::platform::cpu_id() as usize;
+    let Some(state) = super::single_step::take_pending(cpu_id) else {
+        return false;
+    };
+
+    if let Err(e) = super::manager::reinject_brk(state.hva) {
+        log::warn!(
+            "guest_kprobe: failed to reinject BRK at hva={:#x}: {}",
+            state.hva,
+            e
+        );
+    }
+
+    log::debug!(
+        "guest_kprobe: single-step complete vm{}:{:#x} on cpu{}, BRK reinjected",
+        state.vm_id,
+        state.probe_gva,
+        cpu_id
+    );
+
+    true
 }
