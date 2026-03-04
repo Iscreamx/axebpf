@@ -6,7 +6,7 @@ description = "eBPF runtime, symbol table, and tracepoint framework for AxVisor"
 authors = ["iscreamx404@gmail.com"]
 
 [features]
-default = ["symbols", "tracepoint-support", "runtime", "axhal"]
+default = ["symbols", "tracepoint-support", "runtime"]
 symbols = ["ksym"]
 tracepoint-support = ["symbols", "dep:tracepoint", "tp-lexer", "spin", "static-keys"]
 runtime = ["rbpf", "kbpf-basic", "spin", "dep:aya-obj", "dep:hashbrown", "dep:axalloc"]

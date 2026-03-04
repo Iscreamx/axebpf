@@ -65,6 +65,9 @@ pub mod page_table;
 #[cfg(any(feature = "hprobe", feature = "guest-kprobe"))]
 pub mod probe;
 
+#[cfg(feature = "guest-kprobe")]
+pub mod guest_symbols;
+
 #[cfg(feature = "tracepoint-support")]
 pub mod trace_ops;
 

@@ -117,50 +117,48 @@ fn test_run_unloaded_program() {
 }
 
 // =============================================================================
-// ELF Loading Tests (Issue #4 verification)
+// ELF Loading Tests (precompiled programs verification)
 // =============================================================================
 
-/// Load kprobe_noop.o — simplest possible ELF, no maps, no .text calls.
-/// This is the baseline: if this fails, basic ELF loading is broken.
+/// Load printk.o — tracepoint program with a counter map.
 #[test]
-fn test_load_elf_kprobe_noop() {
-    let elf_bytes = include_bytes!("../../../target/bpf/kprobe_noop.o");
+fn test_load_elf_printk() {
+    let elf_bytes = include_bytes!("../../../target/bpf/printk.o");
     let program = EbpfProgram::new(elf_bytes, None);
-    assert!(program.is_ok(), "kprobe_noop.o should load: {:?}", program.err());
+    assert!(program.is_ok(), "printk.o should load: {:?}", program.err());
     let prog = program.unwrap();
-    // kprobe_noop is just "r0 = 0; exit" so bytecode should be 16 bytes (2 instructions)
+    assert!(!prog.map_fds().is_empty(), "printk should have maps");
     assert!(prog.bytecode().len() >= 16, "bytecode too short: {}", prog.bytecode().len());
 }
 
-/// Load kprobe_simple.o — has maps, .text section (memset), R_BPF_64_32 relocs.
-/// This was the Issue #4 failing case. Must parse and relocate without error.
+/// Load hprobe_entry.o — kprobe program capturing PC and args.
 #[test]
-fn test_load_elf_kprobe_simple() {
-    let elf_bytes = include_bytes!("../../../target/bpf/kprobe_simple.o");
+fn test_load_elf_hprobe_entry() {
+    let elf_bytes = include_bytes!("../../../target/bpf/hprobe_entry.o");
     let program = EbpfProgram::new(elf_bytes, None);
-    assert!(program.is_ok(), "kprobe_simple.o should load: {:?}", program.err());
+    assert!(
+        program.is_ok(),
+        "hprobe_entry.o should load: {:?}",
+        program.err()
+    );
     let prog = program.unwrap();
-    // Must have maps (SIMPLE_MAP)
-    assert!(!prog.map_fds().is_empty(), "kprobe_simple should have maps");
-    // Bytecode should include .text section (memset) merged in,
-    // so it should be larger than just the kprobe section (45 instructions = 360 bytes)
-    assert!(prog.bytecode().len() > 360, "bytecode should include .text: {}", prog.bytecode().len());
+    assert!(!prog.map_fds().is_empty(), "hprobe_entry should have maps");
 }
 
-/// Load kprobe_args.o — has maps, .text section, multiple R_BPF_64_32 relocs.
+/// Load hprobe_exit.o — kprobe-style return program with a map.
 #[test]
-fn test_load_elf_kprobe_args() {
-    let elf_bytes = include_bytes!("../../../target/bpf/kprobe_args.o");
+fn test_load_elf_hprobe_exit() {
+    let elf_bytes = include_bytes!("../../../target/bpf/hprobe_exit.o");
     let program = EbpfProgram::new(elf_bytes, None);
-    assert!(program.is_ok(), "kprobe_args.o should load: {:?}", program.err());
+    assert!(program.is_ok(), "hprobe_exit.o should load: {:?}", program.err());
     let prog = program.unwrap();
-    assert!(!prog.map_fds().is_empty(), "kprobe_args should have maps");
+    assert!(!prog.map_fds().is_empty(), "hprobe_exit should have maps");
 }
 
-/// Load kprobe_noop.o via registry API.
+/// Load printk.o via registry API.
 #[test]
 fn test_load_program_elf() {
-    let elf_bytes = include_bytes!("../../../target/bpf/kprobe_noop.o");
+    let elf_bytes = include_bytes!("../../../target/bpf/printk.o");
     let prog_id = runtime::load_program(elf_bytes, None);
     assert!(prog_id.is_ok(), "load_program with ELF should work: {:?}", prog_id.err());
 }

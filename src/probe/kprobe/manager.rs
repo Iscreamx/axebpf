@@ -421,6 +421,18 @@ pub fn detach(vm_id: u32, gva: u64) -> Result<(), &'static str> {
     unregister(vm_id, gva)
 }
 
+/// Set or clear symbol name for an existing guest kprobe entry.
+pub fn set_symbol(vm_id: u32, gva: u64, symbol: Option<&str>) -> Result<(), &'static str> {
+    let mut registry = GUEST_KPROBE_REGISTRY.lock();
+    let registry = registry.as_mut().ok_or("guest kprobe not initialized")?;
+    let entry = registry
+        .probes
+        .get_mut(&(vm_id, gva))
+        .ok_or("guest kprobe not found")?;
+    entry.symbol = symbol.map(String::from);
+    Ok(())
+}
+
 /// Recover from stale BRK traps after probe detach.
 ///
 /// Returns `true` when a stale BRK trap was matched and recovered, and
