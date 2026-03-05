@@ -263,3 +263,21 @@ pub fn init_with_symbols(kallsyms_data: &'static [u8], stext: u64, etext: u64) {
 
     info!("axebpf initialization complete");
 }
+
+// =============================================================================
+// VM Lifecycle Cleanup
+// =============================================================================
+
+/// Clean up all eBPF resources associated with one VM.
+///
+/// This should be called when a VM is destroyed.
+#[cfg(feature = "guest-kprobe")]
+pub fn cleanup_vm(vm_id: u32) {
+    let detached = probe::kprobe::manager::detach_all_for_vm(vm_id);
+    guest_symbols::unload(vm_id);
+    info!(
+        "axebpf: cleaned up vm{} ({} probes detached)",
+        vm_id,
+        detached
+    );
+}

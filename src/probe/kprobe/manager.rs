@@ -421,6 +421,49 @@ pub fn detach(vm_id: u32, gva: u64) -> Result<(), &'static str> {
     unregister(vm_id, gva)
 }
 
+/// Detach and unregister all guest kprobes for one VM.
+///
+/// Individual cleanup failures are logged and skipped so that
+/// the rest of the VM probes can still be processed.
+pub fn detach_all_for_vm(vm_id: u32) -> usize {
+    let mut registry = GUEST_KPROBE_REGISTRY.lock();
+    let Some(registry) = registry.as_mut() else {
+        return 0;
+    };
+
+    let keys: Vec<ProbeKey> = registry
+        .probes
+        .keys()
+        .filter(|&&(vid, _)| vid == vm_id)
+        .copied()
+        .collect();
+
+    let removed = keys.len();
+    for (vid, gva) in keys {
+        if let Err(e) = registry.disable(vid, gva) {
+            log::warn!(
+                "guest_kprobe: cleanup disable vm{}:{:#x} failed: {}",
+                vid,
+                gva,
+                e
+            );
+        }
+        if let Err(e) = registry.unregister(vid, gva) {
+            log::warn!(
+                "guest_kprobe: cleanup unregister vm{}:{:#x} failed: {}",
+                vid,
+                gva,
+                e
+            );
+        }
+    }
+
+    if removed > 0 {
+        log::info!("guest_kprobe: detached {} probes for vm{}", removed, vm_id);
+    }
+    removed
+}
+
 /// Set or clear symbol name for an existing guest kprobe entry.
 pub fn set_symbol(vm_id: u32, gva: u64, symbol: Option<&str>) -> Result<(), &'static str> {
     let mut registry = GUEST_KPROBE_REGISTRY.lock();

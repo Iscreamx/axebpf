@@ -135,3 +135,33 @@ fn brk_inject_enable_then_disable_restores_instruction() {
         assert_eq!(bytes, [0x78, 0x56, 0x34, 0x12]);
     }
 }
+
+#[test]
+fn detach_all_for_vm_removes_only_target_vm() {
+    manager::init();
+    setup_stage2_backends();
+
+    let vm_a = 10;
+    let vm_b = 11;
+    let gva1 = 0xa000_u64;
+    let gva2 = 0xa100_u64;
+    let gva3 = 0xb000_u64;
+
+    // Clean up leftovers from prior runs.
+    let _ = manager::detach(vm_a, gva1);
+    let _ = manager::detach(vm_a, gva2);
+    let _ = manager::detach(vm_b, gva3);
+
+    manager::attach(vm_a, gva1, 1, false, KprobeMode::Stage2Fault).unwrap();
+    manager::attach(vm_a, gva2, 2, false, KprobeMode::Stage2Fault).unwrap();
+    manager::attach(vm_b, gva3, 3, false, KprobeMode::Stage2Fault).unwrap();
+
+    let removed = manager::detach_all_for_vm(vm_a);
+    assert_eq!(removed, 2);
+
+    assert!(manager::lookup_enabled(vm_a, gva1).is_none());
+    assert!(manager::lookup_enabled(vm_a, gva2).is_none());
+    assert!(manager::lookup_enabled(vm_b, gva3).is_some());
+
+    let _ = manager::detach(vm_b, gva3);
+}
