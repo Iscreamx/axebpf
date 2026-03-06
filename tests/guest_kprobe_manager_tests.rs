@@ -5,6 +5,15 @@ use axebpf::probe::kprobe::addr_translate::{
     register_guest_pt_read_hook, register_gva_to_hva_hook, register_vm_ttbr1_hook,
 };
 use axerrno::AxResult;
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+fn test_guard() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    match LOCK.get_or_init(|| Mutex::new(())).lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 
 fn mock_vm_ttbr1(vm_id: u32) -> AxResult<u64> {
     Ok(0x2000_0000 + ((vm_id as u64) << 20))
@@ -58,6 +67,7 @@ fn mock_gva_to_hva(_gva: u64, _vm_id: u32) -> AxResult<usize> {
 #[cfg(feature = "test-utils")]
 #[test]
 fn attach_must_rollback_when_enable_fails() {
+    let _guard = test_guard();
     manager::init();
     setup_stage2_backends();
     let vm_id = 1;
@@ -79,6 +89,7 @@ fn attach_must_rollback_when_enable_fails() {
 
 #[test]
 fn duplicate_attach_same_key_returns_conflict() {
+    let _guard = test_guard();
     manager::init();
     setup_stage2_backends();
     let vm_id = 2;
@@ -93,6 +104,7 @@ fn duplicate_attach_same_key_returns_conflict() {
 
 #[test]
 fn disable_and_detach_are_idempotent() {
+    let _guard = test_guard();
     manager::init();
     setup_stage2_backends();
     let vm_id = 3;
@@ -111,7 +123,9 @@ fn disable_and_detach_are_idempotent() {
 #[cfg(feature = "test-utils")]
 #[test]
 fn brk_inject_enable_then_disable_restores_instruction() {
+    let _guard = test_guard();
     manager::init();
+    setup_stage2_backends();
     register_gva_to_hva_hook(mock_gva_to_hva);
     let vm_id = 4;
     let gva = 0x4000_u64;
@@ -143,6 +157,7 @@ fn brk_inject_enable_then_disable_restores_instruction() {
 
 #[test]
 fn detach_all_for_vm_removes_only_target_vm() {
+    let _guard = test_guard();
     manager::init();
     setup_stage2_backends();
 
@@ -173,6 +188,7 @@ fn detach_all_for_vm_removes_only_target_vm() {
 
 #[test]
 fn brk_lookup_hit_must_include_resolved_gpa() {
+    let _guard = test_guard();
     manager::init();
     setup_stage2_backends();
     register_gva_to_hva_hook(mock_gva_to_hva);
