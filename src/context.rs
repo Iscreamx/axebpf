@@ -29,6 +29,8 @@ pub struct TraceContext {
     pub probe_type: u32,
     /// Reserved for alignment
     pub _reserved: u32,
+    /// Guest registers (x0-x7 on AArch64) for kprobe context
+    pub regs: [u64; 8],
 }
 
 impl TraceContext {
@@ -60,6 +62,12 @@ impl TraceContext {
     /// Set probe type
     pub fn with_probe_type(mut self, probe_type: u32) -> Self {
         self.probe_type = probe_type;
+        self
+    }
+
+    /// Set guest registers (x0-x7).
+    pub fn with_regs(mut self, regs: &[u64; 8]) -> Self {
+        self.regs = *regs;
         self
     }
 

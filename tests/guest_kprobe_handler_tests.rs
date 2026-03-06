@@ -7,8 +7,17 @@ use axebpf::probe::kprobe::{
     single_step,
 };
 use axerrno::AxResult;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 static mut MOCK_GUEST_INSN: u32 = 0x1400_0000;
+
+fn test_guard() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    match LOCK.get_or_init(|| Mutex::new(())).lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 
 fn mock_vm_ttbr1(vm_id: u32) -> AxResult<u64> {
     Ok(0x1000_0000 + ((vm_id as u64) << 20))
@@ -59,6 +68,7 @@ fn setup_mock_backends() {
 
 #[test]
 fn stage2_match_must_return_true() {
+    let _guard = test_guard();
     manager::init();
     setup_mock_backends();
     let vm_id = 7;
@@ -66,7 +76,7 @@ fn stage2_match_must_return_true() {
     let _ = manager::detach(vm_id, gva);
 
     manager::attach(vm_id, gva, 1, false, KprobeMode::Stage2Fault).unwrap();
-    let handled = handler::handle_stage2_exec_fault(vm_id, 0x1000, gva, true);
+    let handled = handler::handle_stage2_exec_fault(vm_id, 0x1000, gva, true, &[0u64; 8]);
     assert!(handled, "matched stage2 fault must be handled");
 
     manager::detach(vm_id, gva).unwrap();
@@ -74,6 +84,7 @@ fn stage2_match_must_return_true() {
 
 #[test]
 fn guest_brk_match_must_return_true() {
+    let _guard = test_guard();
     manager::init();
     setup_mock_backends();
     let vm_id = 9;
@@ -81,7 +92,7 @@ fn guest_brk_match_must_return_true() {
     let _ = manager::detach(vm_id, pc);
 
     manager::attach(vm_id, pc, 2, false, KprobeMode::BrkInject).unwrap();
-    let handled = handler::handle_guest_brk(vm_id, pc, 0x123);
+    let handled = handler::handle_guest_brk(vm_id, pc, 0x123, &[0u64; 8]);
     assert_eq!(
         handled,
         handler::GuestBrkHandleResult::ProbeHitSingleStep,
@@ -93,6 +104,7 @@ fn guest_brk_match_must_return_true() {
 
 #[test]
 fn guest_brk_single_step_setup_fail_must_fallback_skip() {
+    let _guard = test_guard();
     manager::init();
     setup_mock_backends();
     let vm_id = 11;
@@ -101,7 +113,7 @@ fn guest_brk_single_step_setup_fail_must_fallback_skip() {
 
     manager::attach(vm_id, pc, 4, false, KprobeMode::BrkInject).unwrap();
     single_step::set_force_pending_fail_for_test(true);
-    let handled = handler::handle_guest_brk(vm_id, pc, 0x456);
+    let handled = handler::handle_guest_brk(vm_id, pc, 0x456, &[0u64; 8]);
     single_step::set_force_pending_fail_for_test(false);
     assert_eq!(
         handled,
@@ -114,6 +126,7 @@ fn guest_brk_single_step_setup_fail_must_fallback_skip() {
 
 #[test]
 fn single_step_state_must_support_large_cpu_id() {
+    let _guard = test_guard();
     single_step::clear_pending_for_test();
 
     let cpu = 4096usize;
@@ -139,6 +152,7 @@ fn single_step_state_must_support_large_cpu_id() {
 
 #[test]
 fn stale_guest_brk_after_detach_must_request_retry() {
+    let _guard = test_guard();
     manager::init();
     setup_mock_backends();
     let vm_id = 10;
@@ -148,7 +162,7 @@ fn stale_guest_brk_after_detach_must_request_retry() {
     manager::attach(vm_id, pc, 3, false, KprobeMode::BrkInject).unwrap();
     manager::detach(vm_id, pc).unwrap();
 
-    let handled = handler::handle_guest_brk(vm_id, pc, 0);
+    let handled = handler::handle_guest_brk(vm_id, pc, 0, &[0u64; 8]);
     assert_eq!(
         handled,
         handler::GuestBrkHandleResult::RetryInstruction,
