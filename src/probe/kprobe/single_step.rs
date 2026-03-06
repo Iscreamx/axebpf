@@ -23,6 +23,10 @@ pub struct KprobeSingleStepState {
     pub vm_id: u32,
     /// HVA of the probe point for BRK re-injection.
     pub hva: usize,
+    /// GPA of the probe page used for Stage-2 XN busy-retry.
+    pub gpa: u64,
+    /// Size of the protected Stage-2 execute barrier region.
+    pub gpa_size: u64,
 }
 
 static SS_STATE: Mutex<BTreeMap<usize, KprobeSingleStepState>> = Mutex::new(BTreeMap::new());
@@ -47,6 +51,16 @@ pub fn take_pending(cpu: usize) -> Option<KprobeSingleStepState> {
     SS_STATE.lock().remove(&cpu).filter(|state| state.active)
 }
 
+/// Read pending single-step state without consuming it.
+pub fn peek_pending(cpu: usize) -> Option<KprobeSingleStepState> {
+    SS_STATE.lock().get(&cpu).copied().filter(|state| state.active)
+}
+
+/// Clear pending single-step state for a CPU.
+pub fn clear_pending(cpu: usize) -> Option<KprobeSingleStepState> {
+    SS_STATE.lock().remove(&cpu)
+}
+
 /// Check if a CPU has pending single-step state.
 pub fn is_pending(cpu: usize) -> bool {
     SS_STATE
@@ -54,6 +68,27 @@ pub fn is_pending(cpu: usize) -> bool {
         .get(&cpu)
         .map(|state| state.active)
         .unwrap_or(false)
+}
+
+/// Check whether any CPU is single-stepping on the same 4K page.
+pub fn is_stepping_on_page(vm_id: u32, gpa: u64) -> bool {
+    if gpa == 0 {
+        return false;
+    }
+    SS_STATE
+        .lock()
+        .values()
+        .any(|state| {
+            if !state.active || state.vm_id != vm_id || state.gpa == 0 {
+                return false;
+            }
+            let size = if state.gpa_size == 0 {
+                0x1000
+            } else {
+                state.gpa_size
+            };
+            gpa >= state.gpa && gpa < state.gpa.saturating_add(size)
+        })
 }
 
 #[cfg(any(test, feature = "test-utils"))]

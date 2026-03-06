@@ -466,6 +466,11 @@ pub fn program_count() -> usize {
     registry.iter().filter(|p| p.is_some()).count()
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+pub fn clear_program_registry_for_test() {
+    PROGRAM_REGISTRY.lock().clear();
+}
+
 /// Information about a loaded program.
 #[derive(Debug, Clone)]
 pub struct ProgramInfo {

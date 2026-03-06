@@ -86,6 +86,10 @@ pub fn handle_stage2_exec_fault(
         return false;
     }
 
+    if should_busy_retry_gpa(vm_id, gpa) {
+        return true;
+    }
+
     if let Some((prog_id, is_ret)) = super::manager::lookup_enabled(vm_id, gva) {
         let _ = super::manager::record_probe_hit(vm_id, gva);
 
@@ -117,6 +121,35 @@ pub fn handle_stage2_exec_fault(
     false
 }
 
+fn should_busy_retry_gpa(vm_id: u32, gpa: u64) -> bool {
+    if super::single_step::is_stepping_on_page(vm_id, gpa) {
+        log::trace!(
+            "guest_kprobe: busy-retry for stepping page vm{}:gpa={:#x}",
+            vm_id,
+            gpa
+        );
+        return true;
+    }
+    false
+}
+
+pub fn should_busy_retry_gva(vm_id: u32, gva: u64) -> bool {
+    if gva == 0 {
+        return false;
+    }
+
+    let cpu_id = crate::platform::cpu_id() as usize;
+    if super::single_step::peek_pending(cpu_id).is_some() {
+        return false;
+    }
+
+    let Ok(gpa) = super::addr_translate::gva_to_gpa_with_vm(gva, vm_id) else {
+        return false;
+    };
+
+    should_busy_retry_gpa(vm_id, gpa)
+}
+
 /// Handle a guest BRK exception routed to EL2 (for BRK inject mode).
 ///
 /// # Arguments
@@ -144,10 +177,16 @@ pub fn handle_guest_brk(
             crate::tracepoints::hypervisor_helpers::clear_current_context();
         }
 
-        if let Err(e) = super::manager::restore_insn_for_step(hit.hva, hit.saved_insn) {
-            log::warn!("guest_kprobe: failed to restore insn for step: {}", e);
-            return GuestBrkHandleResult::ProbeHitFallbackSkip;
-        }
+        let step_gpa = match hit.gpa {
+            Some(gpa) => match super::manager::set_stage2_executable(vm_id, gpa, false) {
+                Ok(()) => gpa,
+                Err(e) => {
+                    log::warn!("guest_kprobe: failed to set XN for stepping: {}", e);
+                    0
+                }
+            },
+            None => 0,
+        };
 
         let cpu_id = crate::platform::cpu_id() as usize;
         let state = super::single_step::KprobeSingleStepState {
@@ -156,20 +195,38 @@ pub fn handle_guest_brk(
             saved_insn: hit.saved_insn,
             vm_id,
             hva: hit.hva,
+            gpa: step_gpa,
+            gpa_size: hit.gpa_size,
         };
         if let Err(e) = super::single_step::set_pending(cpu_id, state) {
             log::warn!("guest_kprobe: failed to set single-step pending state: {}", e);
-            if let Err(reinject_err) = super::manager::reinject_brk(hit.hva) {
-                log::warn!(
-                    "guest_kprobe: failed to re-inject BRK after pending-state failure: {}",
-                    reinject_err
-                );
+            if step_gpa != 0 {
+                if let Err(clear_err) = super::manager::set_stage2_executable(vm_id, step_gpa, true) {
+                    log::warn!(
+                        "guest_kprobe: failed to clear XN after pending-state failure: {}",
+                        clear_err
+                    );
+                }
+            }
+            return GuestBrkHandleResult::ProbeHitFallbackSkip;
+        }
+
+        if let Err(e) = super::manager::restore_insn_for_step(hit.hva, hit.saved_insn) {
+            log::warn!("guest_kprobe: failed to restore insn for step: {}", e);
+            let _ = super::single_step::clear_pending(cpu_id);
+            if step_gpa != 0 {
+                if let Err(clear_err) = super::manager::set_stage2_executable(vm_id, step_gpa, true) {
+                    log::warn!(
+                        "guest_kprobe: failed to clear XN after restore failure: {}",
+                        clear_err
+                    );
+                }
             }
             return GuestBrkHandleResult::ProbeHitFallbackSkip;
         }
 
         log::debug!(
-            "guest_kprobe: BRK hit vm{}:{:#x}, restored insn, pending single-step on cpu{}",
+            "guest_kprobe: BRK hit vm{}:{:#x}, pending single-step on cpu{}",
             vm_id,
             pc,
             cpu_id
@@ -195,7 +252,7 @@ pub fn handle_guest_brk(
 /// Returns `true` if the exception belongs to a pending kprobe single-step.
 pub fn handle_software_step() -> bool {
     let cpu_id = crate::platform::cpu_id() as usize;
-    let Some(state) = super::single_step::take_pending(cpu_id) else {
+    let Some(state) = super::single_step::peek_pending(cpu_id) else {
         return false;
     };
 
@@ -206,6 +263,19 @@ pub fn handle_software_step() -> bool {
             e
         );
     }
+
+    if state.gpa != 0 {
+        if let Err(e) = super::manager::set_stage2_executable(state.vm_id, state.gpa, true) {
+            log::warn!(
+                "guest_kprobe: failed to clear XN after step vm{}:gpa={:#x}: {}",
+                state.vm_id,
+                state.gpa,
+                e
+            );
+        }
+    }
+
+    let _ = super::single_step::clear_pending(cpu_id);
 
     log::debug!(
         "guest_kprobe: single-step complete vm{}:{:#x} on cpu{}, BRK reinjected",

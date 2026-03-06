@@ -4,6 +4,7 @@
 
 use axebpf::attach::{self, Error};
 use axebpf::runtime;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// Simple program: mov r0, 42; exit
 const PROG_RETURN_42: &[u8] = &[
@@ -17,12 +18,37 @@ const PROG_RETURN_ZERO: &[u8] = &[
     0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // exit
 ];
 
+struct TestGuard {
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl Drop for TestGuard {
+    fn drop(&mut self) {
+        attach::clear_attachments_for_test();
+        runtime::clear_program_registry_for_test();
+    }
+}
+
+fn test_guard() -> TestGuard {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let lock = match LOCK.get_or_init(|| Mutex::new(())).lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    attach::clear_attachments_for_test();
+    runtime::clear_program_registry_for_test();
+
+    TestGuard { _lock: lock }
+}
+
 // =============================================================================
 // Attach Tests
 // =============================================================================
 
 #[test]
 fn test_attach_success() {
+    let _guard = test_guard();
     let prog_id = runtime::load_program(PROG_RETURN_42, None).unwrap();
     let tracepoint = "test:attach_success";
 
@@ -36,12 +62,14 @@ fn test_attach_success() {
 
 #[test]
 fn test_attach_program_not_found() {
+    let _guard = test_guard();
     let result = attach::attach("test:nonexistent_prog", 99999, "test");
     assert!(matches!(result, Err(Error::ProgramNotFound(99999))));
 }
 
 #[test]
 fn test_attach_already_attached() {
+    let _guard = test_guard();
     let prog_id = runtime::load_program(PROG_RETURN_42, None).unwrap();
     let tracepoint = "test:already_attached";
 
@@ -65,6 +93,7 @@ fn test_attach_already_attached() {
 
 #[test]
 fn test_detach_success() {
+    let _guard = test_guard();
     let prog_id = runtime::load_program(PROG_RETURN_42, None).unwrap();
     let tracepoint = "test:detach_success";
 
@@ -80,6 +109,7 @@ fn test_detach_success() {
 
 #[test]
 fn test_detach_not_attached() {
+    let _guard = test_guard();
     let result = attach::detach("test:not_attached");
     assert!(matches!(result, Err(Error::NotAttached(_))));
 }
@@ -90,6 +120,7 @@ fn test_detach_not_attached() {
 
 #[test]
 fn test_get_attached_exists() {
+    let _guard = test_guard();
     let prog_id = runtime::load_program(PROG_RETURN_42, None).unwrap();
     let tracepoint = "test:get_attached_exists";
 
@@ -106,12 +137,14 @@ fn test_get_attached_exists() {
 
 #[test]
 fn test_get_attached_not_exists() {
+    let _guard = test_guard();
     let result = attach::get_attached("test:nonexistent");
     assert!(result.is_none());
 }
 
 #[test]
 fn test_get_attached_after_detach() {
+    let _guard = test_guard();
     let prog_id = runtime::load_program(PROG_RETURN_42, None).unwrap();
     let tracepoint = "test:get_after_detach";
 
@@ -131,6 +164,7 @@ fn test_get_attached_after_detach() {
 
 #[test]
 fn test_list_attachments() {
+    let _guard = test_guard();
     let prog_id1 = runtime::load_program(PROG_RETURN_42, None).unwrap();
     let prog_id2 = runtime::load_program(PROG_RETURN_ZERO, None).unwrap();
     let tp1 = "test:list_attach_1";
@@ -165,6 +199,7 @@ fn test_list_attachments() {
 
 #[test]
 fn test_attachment_count() {
+    let _guard = test_guard();
     let initial_count = attach::attachment_count();
 
     let prog_id = runtime::load_program(PROG_RETURN_42, None).unwrap();
@@ -186,6 +221,7 @@ fn test_attachment_count() {
 
 #[test]
 fn test_error_display() {
+    let _guard = test_guard();
     let err = Error::TracepointNotFound("test:tp".to_string());
     assert!(format!("{}", err).contains("test:tp"));
 
@@ -205,6 +241,7 @@ fn test_error_display() {
 
 #[test]
 fn test_reattach_after_detach() {
+    let _guard = test_guard();
     let prog_id = runtime::load_program(PROG_RETURN_42, None).unwrap();
     let tracepoint = "test:reattach";
 
@@ -231,6 +268,7 @@ fn test_reattach_after_detach() {
 
 #[test]
 fn test_attach_different_program_after_detach() {
+    let _guard = test_guard();
     let prog_id1 = runtime::load_program(PROG_RETURN_42, None).unwrap();
     let prog_id2 = runtime::load_program(PROG_RETURN_ZERO, None).unwrap();
     let tracepoint = "test:different_prog";
@@ -254,4 +292,23 @@ fn test_attach_different_program_after_detach() {
     let _ = attach::detach(tracepoint);
     let _ = runtime::unload_program(prog_id1);
     let _ = runtime::unload_program(prog_id2);
+}
+
+#[test]
+fn test_reset_for_test_clears_global_state() {
+    let _guard = test_guard();
+
+    let prog_id = runtime::load_program(PROG_RETURN_42, None).unwrap();
+    attach::attach("test:reset_state", prog_id, "test").unwrap();
+
+    assert_eq!(runtime::program_count(), 1);
+    assert_eq!(attach::attachment_count(), 1);
+
+    attach::clear_attachments_for_test();
+    runtime::clear_program_registry_for_test();
+
+    assert_eq!(attach::attachment_count(), 0);
+    assert_eq!(runtime::program_count(), 0);
+    assert!(attach::get_attached("test:reset_state").is_none());
+    assert!(runtime::get_program(prog_id).is_none());
 }

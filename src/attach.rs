@@ -149,3 +149,8 @@ pub fn attachment_count() -> usize {
     let attachments = ATTACHMENTS.lock();
     attachments.len()
 }
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn clear_attachments_for_test() {
+    ATTACHMENTS.lock().clear();
+}

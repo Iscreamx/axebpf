@@ -13,6 +13,7 @@ use spin::Mutex;
 use spin::RwLock;
 
 type Stage2ExecHook = fn(vm_id: u32, gpa: u64, executable: bool) -> axerrno::AxResult<()>;
+type Stage2ExecRegionHook = fn(vm_id: u32, gpa: u64) -> axerrno::AxResult<(u64, u64)>;
 
 /// Guest kprobe injection mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +54,8 @@ pub struct GuestKprobeEntry {
     pub saved_insn: Option<u32>,
     /// Resolved guest physical address for Stage-2 mode.
     pub resolved_gpa: Option<u64>,
+    /// Resolved Stage-2 execute barrier size.
+    pub resolved_gpa_size: Option<u64>,
     /// Resolved host virtual address for BRK mode.
     pub resolved_hva: Option<usize>,
 }
@@ -74,6 +77,7 @@ const STALE_BRK_RETRY_BUDGET: u32 = 4096;
 /// Global guest kprobe registry.
 static GUEST_KPROBE_REGISTRY: Mutex<Option<GuestKprobeRegistry>> = Mutex::new(None);
 static STAGE2_EXEC_HOOK: RwLock<Option<Stage2ExecHook>> = RwLock::new(None);
+static STAGE2_EXEC_REGION_HOOK: RwLock<Option<Stage2ExecRegionHook>> = RwLock::new(None);
 static STALE_BRK_REGISTRY: Mutex<BTreeMap<ProbeKey, StaleBrkEntry>> = Mutex::new(BTreeMap::new());
 #[cfg(any(test, feature = "test-utils"))]
 static MOCK_FAIL_ENABLE_TARGET: Mutex<Option<ProbeKey>> = Mutex::new(None);
@@ -96,6 +100,8 @@ pub struct BrkProbeHitInfo {
     pub is_ret: bool,
     pub hva: usize,
     pub saved_insn: u32,
+    pub gpa: Option<u64>,
+    pub gpa_size: u64,
 }
 
 impl GuestKprobeRegistry {
@@ -131,6 +137,7 @@ impl GuestKprobeRegistry {
             state: GuestKprobeState::Registered,
             saved_insn: None,
             resolved_gpa: None,
+            resolved_gpa_size: None,
             resolved_hva: None,
         };
 
@@ -167,8 +174,10 @@ impl GuestKprobeRegistry {
                 }
                 let gpa = super::addr_translate::gva_to_gpa_with_vm(gva, vm_id)
                     .map_err(|_| "failed to translate GVA->GPA")?;
-                set_stage2_executable(vm_id, gpa, false)?;
-                entry.resolved_gpa = Some(gpa);
+                let (barrier_gpa, barrier_size) = query_stage2_exec_region(vm_id, gpa)?;
+                set_stage2_executable(vm_id, barrier_gpa, false)?;
+                entry.resolved_gpa = Some(barrier_gpa);
+                entry.resolved_gpa_size = Some(barrier_size);
                 log::info!("guest_kprobe: enabling Stage-2 fault mode for vm{}:{:#x}", vm_id, gva);
             }
             KprobeMode::BrkInject => {
@@ -178,14 +187,21 @@ impl GuestKprobeRegistry {
                 clear_stale_brk(key);
                 let hva = super::addr_translate::gva_to_hva_for_vm(gva, vm_id)
                     .map_err(|_| "failed to translate GVA->HVA")?;
+                let gpa = super::addr_translate::gva_to_gpa_with_vm(gva, vm_id)
+                    .map_err(|_| "failed to translate GVA->GPA")?;
+                let (barrier_gpa, barrier_size) = query_stage2_exec_region(vm_id, gpa)?;
                 let saved = inject_guest_breakpoint(hva)?;
                 entry.saved_insn = Some(saved);
                 entry.resolved_hva = Some(hva);
+                entry.resolved_gpa = Some(barrier_gpa);
+                entry.resolved_gpa_size = Some(barrier_size);
                 log::info!(
-                    "guest_kprobe: BRK patch vm{}:{:#x} hva={:#x} saved_insn={:#010x}",
+                    "guest_kprobe: BRK patch vm{}:{:#x} hva={:#x} gpa={:#x} barrier_size={:#x} saved_insn={:#010x}",
                     vm_id,
                     gva,
                     hva,
+                    barrier_gpa,
+                    barrier_size,
                     saved
                 );
                 log::info!("guest_kprobe: enabling BRK inject mode for vm{}:{:#x}", vm_id, gva);
@@ -213,6 +229,7 @@ impl GuestKprobeRegistry {
                     set_stage2_executable(vm_id, gpa, true)?;
                 }
                 entry.resolved_gpa = None;
+                entry.resolved_gpa_size = None;
             }
             KprobeMode::BrkInject => {
                 if let (Some(hva), Some(saved)) = (entry.resolved_hva, entry.saved_insn) {
@@ -228,6 +245,8 @@ impl GuestKprobeRegistry {
                 }
                 entry.saved_insn = None;
                 entry.resolved_hva = None;
+                entry.resolved_gpa = None;
+                entry.resolved_gpa_size = None;
             }
         }
 
@@ -278,12 +297,25 @@ impl GuestKprobeRegistry {
 }
 
 #[inline]
-fn set_stage2_executable(vm_id: u32, gpa: u64, executable: bool) -> Result<(), &'static str> {
+pub(crate) fn set_stage2_executable(
+    vm_id: u32,
+    gpa: u64,
+    executable: bool,
+) -> Result<(), &'static str> {
     let hook = *STAGE2_EXEC_HOOK.read();
     let Some(f) = hook else {
         return Err("Stage-2 execute hook not registered");
     };
     f(vm_id, gpa, executable).map_err(|_| "failed to update Stage-2 execute permission")
+}
+
+fn query_stage2_exec_region(vm_id: u32, gpa: u64) -> Result<(u64, u64), &'static str> {
+    let hook = *STAGE2_EXEC_REGION_HOOK.read();
+    if let Some(f) = hook {
+        return f(vm_id, gpa)
+            .map_err(|_| "failed to query Stage-2 execute region");
+    }
+    Ok((gpa & !0xfff, 0x1000))
 }
 
 fn inject_guest_breakpoint(hva: usize) -> Result<u32, &'static str> {
@@ -367,9 +399,18 @@ pub fn register_stage2_exec_hook(f: Stage2ExecHook) {
     *STAGE2_EXEC_HOOK.write() = Some(f);
 }
 
+pub fn register_stage2_exec_region_hook(f: Stage2ExecRegionHook) {
+    *STAGE2_EXEC_REGION_HOOK.write() = Some(f);
+}
+
 #[cfg(any(test, feature = "test-utils"))]
 pub fn clear_stage2_exec_hook_for_test() {
     *STAGE2_EXEC_HOOK.write() = None;
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn clear_stage2_exec_region_hook_for_test() {
+    *STAGE2_EXEC_REGION_HOOK.write() = None;
 }
 
 pub fn register(
@@ -573,6 +614,8 @@ pub fn lookup_enabled_brk_hit(vm_id: u32, gva: u64) -> Option<BrkProbeHitInfo> {
         is_ret: entry.is_ret,
         hva,
         saved_insn,
+        gpa: entry.resolved_gpa,
+        gpa_size: entry.resolved_gpa_size.unwrap_or(0x1000),
     })
 }
 

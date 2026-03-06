@@ -36,10 +36,15 @@ fn mock_stage2_exec(_vm_id: u32, _gpa: u64, _executable: bool) -> AxResult<()> {
     Ok(())
 }
 
+fn mock_stage2_exec_region(_vm_id: u32, gpa: u64) -> AxResult<(u64, u64)> {
+    Ok((gpa & !0x1f_ffff, 0x20_0000))
+}
+
 fn setup_stage2_backends() {
     register_vm_ttbr1_hook(mock_vm_ttbr1);
     register_guest_pt_read_hook(mock_guest_pt_read);
     manager::register_stage2_exec_hook(mock_stage2_exec);
+    manager::register_stage2_exec_region_hook(mock_stage2_exec_region);
     #[cfg(feature = "test-utils")]
     manager::clear_stale_brk_for_test();
 }
@@ -164,4 +169,25 @@ fn detach_all_for_vm_removes_only_target_vm() {
     assert!(manager::lookup_enabled(vm_b, gva3).is_some());
 
     let _ = manager::detach(vm_b, gva3);
+}
+
+#[test]
+fn brk_lookup_hit_must_include_resolved_gpa() {
+    manager::init();
+    setup_stage2_backends();
+    register_gva_to_hva_hook(mock_gva_to_hva);
+
+    let vm_id = 12;
+    let gva = 0xffff_8000_8000_1000_u64;
+    let _ = manager::detach(vm_id, gva);
+
+    manager::attach(vm_id, gva, 9, false, KprobeMode::BrkInject).unwrap();
+
+    let expected_gpa = axebpf::probe::kprobe::addr_translate::gva_to_gpa_with_vm(gva, vm_id)
+        .expect("mock GVA->GPA translation must succeed");
+    let hit = manager::lookup_enabled_brk_hit(vm_id, gva).unwrap();
+    assert_eq!(hit.gpa, Some(expected_gpa & !0x1f_ffff));
+    assert_eq!(hit.gpa_size, 0x20_0000);
+
+    manager::detach(vm_id, gva).unwrap();
 }
