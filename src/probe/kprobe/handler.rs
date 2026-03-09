@@ -63,6 +63,16 @@ pub enum GuestBrkHandleResult {
     Unhandled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage2ExecFaultResult {
+    /// The Stage-2 fault hit an enabled probe and armed single-step completion.
+    ProbeHitSingleStep,
+    /// The fault overlaps another CPU's single-step window and should be retried.
+    BusyRetry,
+    /// Not handled by guest-kprobe.
+    Unhandled,
+}
+
 /// Handle a Stage-2 permission fault that may be a guest kprobe.
 ///
 /// Called from the Stage-2 fault handler in the vCPU exit path.
@@ -74,21 +84,65 @@ pub enum GuestBrkHandleResult {
 /// * `is_exec` - Whether this was an instruction fetch fault
 ///
 /// # Returns
-/// `true` if handled as a kprobe, `false` if not a kprobe fault.
+/// Stage-2 handling result for the caller.
 pub fn handle_stage2_exec_fault(
     vm_id: u32,
     gpa: u64,
     gva: u64,
     is_exec: bool,
     regs: &[u64; 8],
-) -> bool {
+) -> Stage2ExecFaultResult {
     if !is_exec {
-        return false;
+        return Stage2ExecFaultResult::Unhandled;
     }
 
     if should_busy_retry_gpa(vm_id, gpa) {
-        return true;
+        return Stage2ExecFaultResult::BusyRetry;
     }
+
+    let arm_stage2_single_step =
+        |probe_gva: u64, barrier_gpa: u64, barrier_size: u64| -> Stage2ExecFaultResult {
+            if let Err(e) = super::manager::set_stage2_executable(vm_id, barrier_gpa, true) {
+                log::warn!(
+                    "guest_kprobe: failed to enable stepping window vm{}:gpa={:#x}: {}",
+                    vm_id,
+                    barrier_gpa,
+                    e
+                );
+                return Stage2ExecFaultResult::Unhandled;
+            }
+
+            let cpu_id = crate::platform::cpu_id() as usize;
+            let state = super::single_step::KprobeSingleStepState {
+                active: true,
+                probe_gva,
+                saved_insn: 0,
+                vm_id,
+                hva: 0,
+                gpa: barrier_gpa,
+                gpa_size: barrier_size,
+                mode: super::single_step::SingleStepMode::Stage2Fault,
+            };
+            if let Err(e) = super::single_step::set_pending(cpu_id, state) {
+                log::warn!(
+                    "guest_kprobe: failed to set stage2 single-step pending state: {}",
+                    e
+                );
+                if let Err(clear_err) =
+                    super::manager::set_stage2_executable(vm_id, barrier_gpa, false)
+                {
+                    log::warn!(
+                        "guest_kprobe: failed to rollback stepping window vm{}:gpa={:#x}: {}",
+                        vm_id,
+                        barrier_gpa,
+                        clear_err
+                    );
+                }
+                return Stage2ExecFaultResult::Unhandled;
+            }
+
+            Stage2ExecFaultResult::ProbeHitSingleStep
+        };
 
     if let Some((prog_id, is_ret)) = super::manager::lookup_enabled(vm_id, gva) {
         let _ = super::manager::record_probe_hit(vm_id, gva);
@@ -104,13 +158,28 @@ pub fn handle_stage2_exec_fault(
             crate::tracepoints::hypervisor_helpers::clear_current_context();
         }
 
-        log::debug!(
+        log::info!(
             "guest_kprobe: matched stage2 fault vm{} gva={:#x} prog_id={}",
             vm_id,
             gva,
             prog_id
         );
-        return true;
+
+        let (barrier_gpa, barrier_size) = super::manager::lookup_stage2_barrier(vm_id, gva)
+            .unwrap_or((gpa & !0xfff, 0x1000));
+        return arm_stage2_single_step(gva, barrier_gpa, barrier_size);
+    }
+
+    if let Some((probe_gva, barrier_gpa, barrier_size)) =
+        super::manager::lookup_enabled_stage2_probe_by_gpa(vm_id, gpa)
+    {
+        log::info!(
+            "guest_kprobe: stage2 page-step vm{} fault_gva={:#x} probe_gva={:#x}",
+            vm_id,
+            gva,
+            probe_gva
+        );
+        return arm_stage2_single_step(probe_gva, barrier_gpa, barrier_size);
     }
 
     log::trace!(
@@ -118,7 +187,7 @@ pub fn handle_stage2_exec_fault(
         vm_id, gpa, gva
     );
 
-    false
+    Stage2ExecFaultResult::Unhandled
 }
 
 fn should_busy_retry_gpa(vm_id: u32, gpa: u64) -> bool {
@@ -197,6 +266,7 @@ pub fn handle_guest_brk(
             hva: hit.hva,
             gpa: step_gpa,
             gpa_size: hit.gpa_size,
+            mode: super::single_step::SingleStepMode::BrkInject,
         };
         if let Err(e) = super::single_step::set_pending(cpu_id, state) {
             log::warn!("guest_kprobe: failed to set single-step pending state: {}", e);
@@ -225,7 +295,7 @@ pub fn handle_guest_brk(
             return GuestBrkHandleResult::ProbeHitFallbackSkip;
         }
 
-        log::debug!(
+        log::info!(
             "guest_kprobe: BRK hit vm{}:{:#x}, pending single-step on cpu{}",
             vm_id,
             pc,
@@ -256,33 +326,61 @@ pub fn handle_software_step() -> bool {
         return false;
     };
 
-    if let Err(e) = super::manager::reinject_brk(state.hva) {
-        log::warn!(
-            "guest_kprobe: failed to reinject BRK at hva={:#x}: {}",
-            state.hva,
-            e
-        );
-    }
-
-    if state.gpa != 0 {
-        if let Err(e) = super::manager::set_stage2_executable(state.vm_id, state.gpa, true) {
-            log::warn!(
-                "guest_kprobe: failed to clear XN after step vm{}:gpa={:#x}: {}",
-                state.vm_id,
-                state.gpa,
-                e
-            );
+    match state.mode {
+        super::single_step::SingleStepMode::BrkInject => {
+            if let Err(e) = super::manager::reinject_brk(state.hva) {
+                log::warn!(
+                    "guest_kprobe: failed to reinject BRK at hva={:#x}: {}",
+                    state.hva,
+                    e
+                );
+            }
+            if state.gpa != 0 {
+                if let Err(e) = super::manager::set_stage2_executable(state.vm_id, state.gpa, true) {
+                    log::warn!(
+                        "guest_kprobe: failed to clear XN after step vm{}:gpa={:#x}: {}",
+                        state.vm_id,
+                        state.gpa,
+                        e
+                    );
+                }
+            }
+        }
+        super::single_step::SingleStepMode::Stage2Fault => {
+            if state.gpa != 0 {
+                if let Err(e) = super::manager::set_stage2_executable(state.vm_id, state.gpa, false)
+                {
+                    log::warn!(
+                        "guest_kprobe: failed to restore XN after step vm{}:gpa={:#x}: {}",
+                        state.vm_id,
+                        state.gpa,
+                        e
+                    );
+                }
+            }
         }
     }
 
     let _ = super::single_step::clear_pending(cpu_id);
 
-    log::debug!(
-        "guest_kprobe: single-step complete vm{}:{:#x} on cpu{}, BRK reinjected",
-        state.vm_id,
-        state.probe_gva,
-        cpu_id
-    );
+    match state.mode {
+        super::single_step::SingleStepMode::BrkInject => {
+            log::info!(
+                "guest_kprobe: single-step complete vm{}:{:#x} on cpu{}, BRK reinjected",
+                state.vm_id,
+                state.probe_gva,
+                cpu_id
+            );
+        }
+        super::single_step::SingleStepMode::Stage2Fault => {
+            log::info!(
+                "guest_kprobe: single-step complete vm{}:{:#x} on cpu{}, XN restored",
+                state.vm_id,
+                state.probe_gva,
+                cpu_id
+            );
+        }
+    }
 
     true
 }

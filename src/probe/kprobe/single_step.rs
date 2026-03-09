@@ -10,6 +10,15 @@ use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
+/// Single-step completion mode for guest kprobe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SingleStepMode {
+    /// Complete a BRK-inject probe by re-injecting BRK after one instruction.
+    BrkInject,
+    /// Complete a Stage-2 fault probe by restoring execute-never after one instruction.
+    Stage2Fault,
+}
+
 /// Per-vCPU single-step tracking.
 #[derive(Clone, Copy)]
 pub struct KprobeSingleStepState {
@@ -27,6 +36,8 @@ pub struct KprobeSingleStepState {
     pub gpa: u64,
     /// Size of the protected Stage-2 execute barrier region.
     pub gpa_size: u64,
+    /// Completion path for this pending single-step state.
+    pub mode: SingleStepMode,
 }
 
 static SS_STATE: Mutex<BTreeMap<usize, KprobeSingleStepState>> = Mutex::new(BTreeMap::new());

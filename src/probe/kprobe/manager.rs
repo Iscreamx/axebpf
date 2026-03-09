@@ -32,6 +32,11 @@ pub enum GuestKprobeState {
     Disabled,
 }
 
+#[inline]
+fn is_ttbr1_not_ready(err: &str) -> bool {
+    err == "VM TTBR1_EL1 is not ready"
+}
+
 /// A registered guest kprobe entry.
 pub struct GuestKprobeEntry {
     /// VM ID this probe targets (0 = all VMs)
@@ -294,6 +299,42 @@ impl GuestKprobeRegistry {
     pub fn list(&self) -> Vec<&GuestKprobeEntry> {
         self.probes.values().collect()
     }
+
+    /// Retry enabling probes that were registered before TTBR1_EL1 became ready.
+    pub fn try_enable_registered_for_vm(&mut self, vm_id: u32) -> usize {
+        let keys: Vec<ProbeKey> = self
+            .probes
+            .iter()
+            .filter_map(|(&(vid, gva), entry)| {
+                (vid == vm_id && entry.state == GuestKprobeState::Registered).then_some((vid, gva))
+            })
+            .collect();
+
+        let mut enabled = 0usize;
+        for (vid, gva) in keys {
+            match self.enable(vid, gva) {
+                Ok(()) => {
+                    enabled += 1;
+                    log::info!(
+                        "guest_kprobe: auto-enabled deferred probe vm{}:{:#x}",
+                        vid,
+                        gva
+                    );
+                }
+                Err(e) if is_ttbr1_not_ready(e) => {}
+                Err(e) => {
+                    log::warn!(
+                        "guest_kprobe: deferred enable vm{}:{:#x} failed: {}",
+                        vid,
+                        gva,
+                        e
+                    );
+                }
+            }
+        }
+
+        enabled
+    }
 }
 
 #[inline]
@@ -452,10 +493,26 @@ pub fn attach(
 ) -> Result<(), &'static str> {
     register(vm_id, gva, prog_id, is_ret, mode)?;
     if let Err(e) = enable(vm_id, gva) {
+        if is_ttbr1_not_ready(e) {
+            log::info!(
+                "guest_kprobe: deferred enable vm{}:{:#x} until TTBR1_EL1 is ready",
+                vm_id,
+                gva
+            );
+            return Ok(());
+        }
         let _ = unregister(vm_id, gva);
         return Err(e);
     }
     Ok(())
+}
+
+pub fn try_enable_registered_for_vm(vm_id: u32) -> usize {
+    let mut registry = GUEST_KPROBE_REGISTRY.lock();
+    let Some(registry) = registry.as_mut() else {
+        return 0;
+    };
+    registry.try_enable_registered_for_vm(vm_id)
 }
 
 pub fn detach(vm_id: u32, gva: u64) -> Result<(), &'static str> {
@@ -594,6 +651,42 @@ pub fn lookup_enabled(vm_id: u32, gva: u64) -> Option<(u32, bool)> {
         return None;
     }
     Some((entry.prog_id, entry.is_ret))
+}
+
+/// Look up the execute barrier tracked for an enabled probe.
+pub fn lookup_stage2_barrier(vm_id: u32, gva: u64) -> Option<(u64, u64)> {
+    let registry = GUEST_KPROBE_REGISTRY.lock();
+    let registry = registry.as_ref()?;
+    let entry = registry.lookup(vm_id, gva)?;
+    if entry.state != GuestKprobeState::Enabled {
+        return None;
+    }
+    let barrier_gpa = entry.resolved_gpa?;
+    let barrier_size = entry.resolved_gpa_size.unwrap_or(0x1000);
+    Some((barrier_gpa, barrier_size))
+}
+
+/// Look up an enabled Stage-2 probe whose execute barrier covers the given GPA.
+pub fn lookup_enabled_stage2_probe_by_gpa(vm_id: u32, gpa: u64) -> Option<(u64, u64, u64)> {
+    let registry = GUEST_KPROBE_REGISTRY.lock();
+    let registry = registry.as_ref()?;
+
+    for entry in registry.list() {
+        if entry.vm_id != vm_id && entry.vm_id != 0 {
+            continue;
+        }
+        if entry.state != GuestKprobeState::Enabled || entry.mode != KprobeMode::Stage2Fault {
+            continue;
+        }
+
+        let barrier_gpa = entry.resolved_gpa?;
+        let barrier_size = entry.resolved_gpa_size.unwrap_or(0x1000);
+        if (barrier_gpa..barrier_gpa.saturating_add(barrier_size)).contains(&gpa) {
+            return Some((entry.gva, barrier_gpa, barrier_size));
+        }
+    }
+
+    None
 }
 
 /// Look up an enabled BRK probe and record one hit in the same lock scope.

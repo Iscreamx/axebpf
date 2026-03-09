@@ -2,9 +2,9 @@
 
 use axebpf::probe::kprobe::{
     addr_translate::{register_guest_pt_read_hook, register_gva_to_hva_hook, register_vm_ttbr1_hook},
-    handler,
+    handler::{self, Stage2ExecFaultResult},
     manager::{self, KprobeMode},
-    single_step,
+    single_step::{self, SingleStepMode},
 };
 use axerrno::AxResult;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -15,7 +15,7 @@ static mut MOCK_GUEST_INSN: u32 = 0x1400_0000;
 struct Stage2HookState {
     calls: Vec<(u32, u64, bool)>,
     nested_fault: Option<(u32, u64, u64)>,
-    nested_result: Option<bool>,
+    nested_result: Option<Stage2ExecFaultResult>,
 }
 
 fn test_guard() -> MutexGuard<'static, ()> {
@@ -119,7 +119,7 @@ fn setup_mock_backends() {
 }
 
 #[test]
-fn stage2_match_must_return_true() {
+fn stage2_match_must_request_single_step() {
     let _guard = test_guard();
     manager::init();
     setup_mock_backends();
@@ -129,9 +129,49 @@ fn stage2_match_must_return_true() {
 
     manager::attach(vm_id, gva, 1, false, KprobeMode::Stage2Fault).unwrap();
     let handled = handler::handle_stage2_exec_fault(vm_id, 0x1000, gva, true, &[0u64; 8]);
-    assert!(handled, "matched stage2 fault must be handled");
+    assert_eq!(
+        handled,
+        Stage2ExecFaultResult::ProbeHitSingleStep,
+        "matched stage2 fault must request hardware single-step"
+    );
+    let _ = single_step::clear_pending(0);
 
     manager::detach(vm_id, gva).unwrap();
+}
+
+#[test]
+fn stage2_same_barrier_non_target_fault_must_single_step() {
+    let _guard = test_guard();
+    manager::init();
+    setup_mock_backends();
+    single_step::clear_pending_for_test();
+
+    let vm_id = 8;
+    let probe_gva = 0xffff_8000_8000_1800_u64;
+    let fault_gva = probe_gva + 0x40;
+    let _ = manager::detach(vm_id, probe_gva);
+
+    manager::attach(vm_id, probe_gva, 11, false, KprobeMode::Stage2Fault).unwrap();
+    let fault_gpa =
+        axebpf::probe::kprobe::addr_translate::gva_to_gpa_with_vm(fault_gva, vm_id).unwrap();
+
+    let handled = handler::handle_stage2_exec_fault(vm_id, fault_gpa, fault_gva, true, &[0u64; 8]);
+    assert_eq!(
+        handled,
+        Stage2ExecFaultResult::ProbeHitSingleStep,
+        "same Stage-2 barrier page must keep single-stepping instead of escaping as unhandled"
+    );
+
+    let pending = single_step::peek_pending(0).unwrap();
+    assert_eq!(
+        pending.probe_gva,
+        probe_gva,
+        "page-level stepping must keep tracking the original probe address"
+    );
+    assert_eq!(pending.mode, SingleStepMode::Stage2Fault);
+
+    let _ = single_step::clear_pending(0);
+    manager::detach(vm_id, probe_gva).unwrap();
 }
 
 #[test]
@@ -158,6 +198,11 @@ fn guest_brk_match_must_return_true() {
         "pending state must carry barrier base GPA"
     );
     assert_eq!(pending.gpa_size, 0x20_0000, "pending state must carry barrier size");
+    assert_eq!(
+        pending.mode,
+        SingleStepMode::BrkInject,
+        "BRK path must tag pending state with BRK mode"
+    );
     let _ = single_step::clear_pending(0);
 
     manager::detach(vm_id, pc).unwrap();
@@ -199,6 +244,7 @@ fn single_step_state_must_support_large_cpu_id() {
         hva: 0x2000,
         gpa: 0x3000,
         gpa_size: 0x1000,
+        mode: SingleStepMode::BrkInject,
     };
     single_step::set_pending(cpu, state).unwrap();
     assert!(single_step::is_pending(cpu), "pending state must be recorded");
@@ -209,6 +255,7 @@ fn single_step_state_must_support_large_cpu_id() {
     assert_eq!(recovered.vm_id, state.vm_id);
     assert_eq!(recovered.hva, state.hva);
     assert_eq!(recovered.gpa, state.gpa);
+    assert_eq!(recovered.mode, state.mode);
     assert!(!single_step::is_pending(cpu), "pending state must be consumed");
 
     single_step::clear_pending_for_test();
@@ -230,6 +277,7 @@ fn is_stepping_on_page_must_detect_same_page() {
         hva: 0x5000,
         gpa,
         gpa_size: 0x1000,
+        mode: SingleStepMode::BrkInject,
     };
     single_step::set_pending(cpu, state).unwrap();
 
@@ -271,6 +319,7 @@ fn peek_pending_must_not_consume_state() {
         hva: 0x3000,
         gpa: 0x4000,
         gpa_size: 0x1000,
+        mode: SingleStepMode::BrkInject,
     };
     single_step::set_pending(cpu, state).unwrap();
 
@@ -281,6 +330,7 @@ fn peek_pending_must_not_consume_state() {
 
     let cleared = single_step::clear_pending(cpu).unwrap();
     assert_eq!(cleared.hva, state.hva);
+    assert_eq!(cleared.mode, state.mode);
     assert!(!single_step::is_pending(cpu), "clear must remove state");
 
     single_step::clear_pending_for_test();
@@ -303,6 +353,7 @@ fn exec_fault_during_stepping_must_busy_retry() {
         hva: 0x5000,
         gpa,
         gpa_size: 0x1000,
+        mode: SingleStepMode::BrkInject,
     };
     single_step::set_pending(0, state).unwrap();
 
@@ -313,7 +364,11 @@ fn exec_fault_during_stepping_must_busy_retry() {
         true,
         &[0u64; 8],
     );
-    assert!(handled, "same-page exec fault must busy-retry");
+    assert_eq!(
+        handled,
+        Stage2ExecFaultResult::BusyRetry,
+        "same-page exec fault must busy-retry"
+    );
 
     let handled_other = handler::handle_stage2_exec_fault(
         vm_id,
@@ -322,7 +377,11 @@ fn exec_fault_during_stepping_must_busy_retry() {
         true,
         &[0u64; 8],
     );
-    assert!(!handled_other, "different page must not busy-retry");
+    assert_eq!(
+        handled_other,
+        Stage2ExecFaultResult::Unhandled,
+        "different page must not busy-retry"
+    );
 
     single_step::clear_pending_for_test();
 }
@@ -346,6 +405,7 @@ fn software_step_must_keep_pending_until_xn_clear() {
         hva: core::ptr::addr_of_mut!(MOCK_GUEST_INSN) as usize,
         gpa,
         gpa_size: 0x1000,
+        mode: SingleStepMode::BrkInject,
     };
     single_step::set_pending(0, state).unwrap();
 
@@ -365,7 +425,7 @@ fn software_step_must_keep_pending_until_xn_clear() {
     };
     assert_eq!(
         hook_state.nested_result,
-        Some(true),
+        Some(Stage2ExecFaultResult::BusyRetry),
         "pending state must remain visible while XN is being cleared"
     );
     drop(hook_state);
@@ -411,6 +471,7 @@ fn is_stepping_on_page_must_respect_barrier_size() {
         hva: 0x7000,
         gpa: barrier_base,
         gpa_size: 0x20_0000,
+        mode: SingleStepMode::BrkInject,
     };
     single_step::set_pending(cpu, state).unwrap();
 
@@ -444,6 +505,7 @@ fn gva_busy_retry_must_skip_owner_cpu_and_match_peer_cpu() {
         hva: 0x9000,
         gpa: gpa & !0x1f_ffff,
         gpa_size: 0x20_0000,
+        mode: SingleStepMode::BrkInject,
     };
     single_step::set_pending(0, state).unwrap();
 
@@ -461,4 +523,159 @@ fn gva_busy_retry_must_skip_owner_cpu_and_match_peer_cpu() {
 
     axebpf::platform::set_mock_cpu_id(0);
     single_step::clear_pending_for_test();
+}
+
+#[test]
+fn stage2_single_step_must_set_pending_with_stage2_mode() {
+    let _guard = test_guard();
+    manager::init();
+    setup_mock_backends();
+    single_step::clear_pending_for_test();
+
+    let vm_id = 32;
+    let gva = 0xffff_8000_8000_5000_u64;
+    let _ = manager::detach(vm_id, gva);
+
+    manager::attach(vm_id, gva, 6, false, KprobeMode::Stage2Fault).unwrap();
+    let gpa = axebpf::probe::kprobe::addr_translate::gva_to_gpa_with_vm(gva, vm_id).unwrap();
+
+    let handled = handler::handle_stage2_exec_fault(vm_id, gpa, gva, true, &[0u64; 8]);
+    assert_eq!(
+        handled,
+        Stage2ExecFaultResult::ProbeHitSingleStep,
+        "matched stage2 fault must arm single-step completion"
+    );
+
+    let pending = single_step::peek_pending(0).unwrap();
+    assert_eq!(pending.probe_gva, gva);
+    assert_eq!(pending.saved_insn, 0, "stage2 flow does not restore guest BRK bytes");
+    assert_eq!(pending.hva, 0, "stage2 flow does not need guest HVA reinjection");
+    assert_eq!(pending.gpa, gpa & !0x1f_ffff, "pending state must store barrier base");
+    assert_eq!(pending.gpa_size, 0x20_0000, "pending state must store barrier size");
+    assert_eq!(
+        pending.mode,
+        SingleStepMode::Stage2Fault,
+        "stage2 flow must record stage2 completion mode"
+    );
+
+    let _ = single_step::clear_pending(0);
+    manager::detach(vm_id, gva).unwrap();
+}
+
+#[test]
+fn stage2_software_step_must_restore_xn() {
+    let _guard = test_guard();
+    manager::init();
+    setup_mock_backends();
+    single_step::clear_pending_for_test();
+    reset_stage2_hook_state();
+    manager::register_stage2_exec_hook(recording_stage2_exec);
+
+    let vm_id = 33;
+    let barrier_gpa = 0x4000_0000_u64;
+    let state = single_step::KprobeSingleStepState {
+        active: true,
+        probe_gva: 0xffff_8000_8000_6000,
+        saved_insn: 0,
+        vm_id,
+        hva: 0,
+        gpa: barrier_gpa,
+        gpa_size: 0x20_0000,
+        mode: SingleStepMode::Stage2Fault,
+    };
+    single_step::set_pending(0, state).unwrap();
+
+    assert!(handler::handle_software_step(), "stage2 pending step must be completed");
+    assert!(
+        single_step::peek_pending(0).is_none(),
+        "software-step completion must clear pending state"
+    );
+
+    let hook_state = match stage2_hook_state().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    assert_eq!(
+        hook_state.calls,
+        vec![(vm_id, barrier_gpa, false)],
+        "stage2 completion must restore execute-never on the barrier"
+    );
+    drop(hook_state);
+
+    reset_stage2_hook_state();
+    manager::register_stage2_exec_hook(mock_stage2_exec);
+}
+
+#[test]
+fn stage2_fault_pending_fail_must_rollback_xn() {
+    let _guard = test_guard();
+    manager::init();
+    setup_mock_backends();
+    single_step::clear_pending_for_test();
+
+    let vm_id = 34;
+    let gva = 0xffff_8000_8000_7000_u64;
+    let _ = manager::detach(vm_id, gva);
+
+    manager::attach(vm_id, gva, 7, false, KprobeMode::Stage2Fault).unwrap();
+    let gpa = axebpf::probe::kprobe::addr_translate::gva_to_gpa_with_vm(gva, vm_id).unwrap();
+    reset_stage2_hook_state();
+    manager::register_stage2_exec_hook(recording_stage2_exec);
+
+    single_step::set_force_pending_fail_for_test(true);
+    let handled = handler::handle_stage2_exec_fault(vm_id, gpa, gva, true, &[0u64; 8]);
+    single_step::set_force_pending_fail_for_test(false);
+
+    assert_eq!(
+        handled,
+        Stage2ExecFaultResult::Unhandled,
+        "pending failure must rollback XN and report unhandled"
+    );
+    assert!(
+        single_step::peek_pending(0).is_none(),
+        "failed stage2 single-step setup must not leave pending state behind"
+    );
+
+    let hook_state = match stage2_hook_state().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    assert_eq!(
+        hook_state.calls,
+        vec![(vm_id, gpa & !0x1f_ffff, true), (vm_id, gpa & !0x1f_ffff, false)],
+        "XN must be opened before arming step and rolled back on failure"
+    );
+    drop(hook_state);
+
+    reset_stage2_hook_state();
+    manager::register_stage2_exec_hook(mock_stage2_exec);
+    manager::detach(vm_id, gva).unwrap();
+}
+
+#[test]
+fn stage2_non_exec_fault_must_return_unhandled() {
+    let _guard = test_guard();
+    manager::init();
+    setup_mock_backends();
+    single_step::clear_pending_for_test();
+
+    let vm_id = 35;
+    let gva = 0xffff_8000_8000_8000_u64;
+    let _ = manager::detach(vm_id, gva);
+
+    manager::attach(vm_id, gva, 8, false, KprobeMode::Stage2Fault).unwrap();
+    let gpa = axebpf::probe::kprobe::addr_translate::gva_to_gpa_with_vm(gva, vm_id).unwrap();
+
+    let handled = handler::handle_stage2_exec_fault(vm_id, gpa, gva, false, &[0u64; 8]);
+    assert_eq!(
+        handled,
+        Stage2ExecFaultResult::Unhandled,
+        "non-exec faults must not enter guest-kprobe single-step flow"
+    );
+    assert!(
+        single_step::peek_pending(0).is_none(),
+        "non-exec faults must not create pending single-step state"
+    );
+
+    manager::detach(vm_id, gva).unwrap();
 }

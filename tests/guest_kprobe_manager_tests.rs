@@ -5,7 +5,10 @@ use axebpf::probe::kprobe::addr_translate::{
     register_guest_pt_read_hook, register_gva_to_hva_hook, register_vm_ttbr1_hook,
 };
 use axerrno::AxResult;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{
+    Mutex, MutexGuard, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 fn test_guard() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -17,6 +20,15 @@ fn test_guard() -> MutexGuard<'static, ()> {
 
 fn mock_vm_ttbr1(vm_id: u32) -> AxResult<u64> {
     Ok(0x2000_0000 + ((vm_id as u64) << 20))
+}
+
+static DEFERRED_TTBR1_READY: AtomicBool = AtomicBool::new(true);
+
+fn mock_vm_ttbr1_deferred(vm_id: u32) -> AxResult<u64> {
+    if !DEFERRED_TTBR1_READY.load(Ordering::Acquire) {
+        return axerrno::ax_err!(BadState, "mock TTBR1_EL1 not ready");
+    }
+    mock_vm_ttbr1(vm_id)
 }
 
 fn mock_guest_pt_read(paddr: u64, vm_id: u32) -> AxResult<u64> {
@@ -51,6 +63,15 @@ fn mock_stage2_exec_region(_vm_id: u32, gpa: u64) -> AxResult<(u64, u64)> {
 
 fn setup_stage2_backends() {
     register_vm_ttbr1_hook(mock_vm_ttbr1);
+    register_guest_pt_read_hook(mock_guest_pt_read);
+    manager::register_stage2_exec_hook(mock_stage2_exec);
+    manager::register_stage2_exec_region_hook(mock_stage2_exec_region);
+    #[cfg(feature = "test-utils")]
+    manager::clear_stale_brk_for_test();
+}
+
+fn setup_deferred_stage2_backends() {
+    register_vm_ttbr1_hook(mock_vm_ttbr1_deferred);
     register_guest_pt_read_hook(mock_guest_pt_read);
     manager::register_stage2_exec_hook(mock_stage2_exec);
     manager::register_stage2_exec_region_hook(mock_stage2_exec_region);
@@ -206,4 +227,80 @@ fn brk_lookup_hit_must_include_resolved_gpa() {
     assert_eq!(hit.gpa_size, 0x20_0000);
 
     manager::detach(vm_id, gva).unwrap();
+}
+
+#[test]
+fn attach_before_ttbr1_ready_must_defer_until_retry() {
+    let _guard = test_guard();
+    manager::init();
+    DEFERRED_TTBR1_READY.store(false, Ordering::Release);
+    setup_deferred_stage2_backends();
+
+    let vm_id = 13;
+    let gva = 0xffff_8000_8000_5000_u64;
+    let _ = manager::detach(vm_id, gva);
+
+    manager::attach(vm_id, gva, 10, false, KprobeMode::Stage2Fault)
+        .expect("attach should stay registered while TTBR1 is not ready");
+    assert!(
+        manager::lookup_enabled(vm_id, gva).is_none(),
+        "probe must not become enabled before TTBR1 is ready"
+    );
+    assert!(
+        manager::list_all()
+            .iter()
+            .any(|(vid, addr, _, _, enabled, _, _, _)| *vid == vm_id && *addr == gva && !enabled),
+        "deferred probe must remain in registry"
+    );
+    assert_eq!(manager::try_enable_registered_for_vm(vm_id), 0);
+
+    DEFERRED_TTBR1_READY.store(true, Ordering::Release);
+    assert_eq!(manager::try_enable_registered_for_vm(vm_id), 1);
+    assert_eq!(manager::lookup_enabled(vm_id, gva), Some((10, false)));
+
+    manager::detach(vm_id, gva).unwrap();
+}
+
+#[cfg(feature = "test-utils")]
+#[test]
+fn brk_attach_before_ttbr1_ready_must_patch_after_retry() {
+    let _guard = test_guard();
+    manager::init();
+    DEFERRED_TTBR1_READY.store(false, Ordering::Release);
+    setup_deferred_stage2_backends();
+    register_gva_to_hva_hook(mock_gva_to_hva);
+
+    let vm_id = 14;
+    let gva = 0xffff_8000_8000_6000_u64;
+    let _ = manager::detach(vm_id, gva);
+
+    unsafe {
+        MOCK_GUEST_TEXT = [0x78, 0x56, 0x34, 0x12];
+    }
+
+    manager::attach(vm_id, gva, 11, false, KprobeMode::BrkInject)
+        .expect("BRK attach should defer until TTBR1 is ready");
+
+    unsafe {
+        let bytes = core::ptr::read_volatile(core::ptr::addr_of!(MOCK_GUEST_TEXT));
+        assert_eq!(bytes, [0x78, 0x56, 0x34, 0x12]);
+    }
+    assert_eq!(manager::try_enable_registered_for_vm(vm_id), 0);
+
+    DEFERRED_TTBR1_READY.store(true, Ordering::Release);
+    assert_eq!(manager::try_enable_registered_for_vm(vm_id), 1);
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let bytes = core::ptr::read_volatile(core::ptr::addr_of!(MOCK_GUEST_TEXT));
+        assert_eq!(bytes, [0x00, 0x00, 0x20, 0xd4]);
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let bytes = core::ptr::read_volatile(core::ptr::addr_of!(MOCK_GUEST_TEXT));
+        assert_eq!(bytes, [0xcc, 0x56, 0x34, 0x12]);
+    }
+
+    manager::detach(vm_id, gva).unwrap();
+    DEFERRED_TTBR1_READY.store(true, Ordering::Release);
 }
