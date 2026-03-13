@@ -76,6 +76,13 @@ struct StaleBrkEntry {
     retries_left: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ReturnBrkState {
+    refcount: u32,
+    hva: usize,
+    saved_insn: u32,
+}
+
 const STALE_BRK_MAX_ENTRIES: usize = 64;
 const STALE_BRK_RETRY_BUDGET: u32 = 4096;
 
@@ -84,6 +91,7 @@ static GUEST_KPROBE_REGISTRY: Mutex<Option<GuestKprobeRegistry>> = Mutex::new(No
 static STAGE2_EXEC_HOOK: RwLock<Option<Stage2ExecHook>> = RwLock::new(None);
 static STAGE2_EXEC_REGION_HOOK: RwLock<Option<Stage2ExecRegionHook>> = RwLock::new(None);
 static STALE_BRK_REGISTRY: Mutex<BTreeMap<ProbeKey, StaleBrkEntry>> = Mutex::new(BTreeMap::new());
+static RETURN_BRK_REFCOUNT: Mutex<BTreeMap<ProbeKey, ReturnBrkState>> = Mutex::new(BTreeMap::new());
 #[cfg(any(test, feature = "test-utils"))]
 static MOCK_FAIL_ENABLE_TARGET: Mutex<Option<ProbeKey>> = Mutex::new(None);
 
@@ -107,6 +115,14 @@ pub struct BrkProbeHitInfo {
     pub saved_insn: u32,
     pub gpa: Option<u64>,
     pub gpa_size: u64,
+}
+
+pub type GuestKprobeListEntry = (u32, u64, Option<String>, u64, bool, bool, u32, KprobeMode);
+
+impl Default for GuestKprobeRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl GuestKprobeRegistry {
@@ -149,7 +165,10 @@ impl GuestKprobeRegistry {
         self.probes.insert(key, entry);
         log::info!(
             "guest_kprobe: registered vm{}:{:#x} (mode={:?}, prog={})",
-            vm_id, gva, mode, prog_id
+            vm_id,
+            gva,
+            mode,
+            prog_id
         );
         Ok(())
     }
@@ -183,7 +202,11 @@ impl GuestKprobeRegistry {
                 set_stage2_executable(vm_id, barrier_gpa, false)?;
                 entry.resolved_gpa = Some(barrier_gpa);
                 entry.resolved_gpa_size = Some(barrier_size);
-                log::info!("guest_kprobe: enabling Stage-2 fault mode for vm{}:{:#x}", vm_id, gva);
+                log::info!(
+                    "guest_kprobe: enabling Stage-2 fault mode for vm{}:{:#x}",
+                    vm_id,
+                    gva
+                );
             }
             KprobeMode::BrkInject => {
                 if super::addr_translate::vm_ttbr1_el1(vm_id).is_err() {
@@ -209,7 +232,11 @@ impl GuestKprobeRegistry {
                     barrier_size,
                     saved
                 );
-                log::info!("guest_kprobe: enabling BRK inject mode for vm{}:{:#x}", vm_id, gva);
+                log::info!(
+                    "guest_kprobe: enabling BRK inject mode for vm{}:{:#x}",
+                    vm_id,
+                    gva
+                );
             }
         }
 
@@ -224,7 +251,8 @@ impl GuestKprobeRegistry {
             return Ok(());
         };
 
-        if entry.state == GuestKprobeState::Disabled || entry.state == GuestKprobeState::Registered {
+        if entry.state == GuestKprobeState::Disabled || entry.state == GuestKprobeState::Registered
+        {
             return Ok(());
         }
 
@@ -274,7 +302,8 @@ impl GuestKprobeRegistry {
     /// Look up a guest kprobe by GVA, checking all VMs and the global (vm_id=0) entry.
     pub fn lookup(&self, vm_id: u32, gva: u64) -> Option<&GuestKprobeEntry> {
         // Check VM-specific first, then global
-        self.probes.get(&(vm_id, gva))
+        self.probes
+            .get(&(vm_id, gva))
             .or_else(|| self.probes.get(&(0, gva)))
     }
 
@@ -353,10 +382,13 @@ pub(crate) fn set_stage2_executable(
 fn query_stage2_exec_region(vm_id: u32, gpa: u64) -> Result<(u64, u64), &'static str> {
     let hook = *STAGE2_EXEC_REGION_HOOK.read();
     if let Some(f) = hook {
-        return f(vm_id, gpa)
-            .map_err(|_| "failed to query Stage-2 execute region");
+        return f(vm_id, gpa).map_err(|_| "failed to query Stage-2 execute region");
     }
     Ok((gpa & !0xfff, 0x1000))
+}
+
+pub fn query_step_barrier(vm_id: u32, gpa: u64) -> (u64, u64) {
+    query_stage2_exec_region(vm_id, gpa).unwrap_or((gpa & !0xfff, 0x1000))
 }
 
 fn inject_guest_breakpoint(hva: usize) -> Result<u32, &'static str> {
@@ -371,7 +403,7 @@ fn inject_guest_breakpoint(hva: usize) -> Result<u32, &'static str> {
     {
         let saved = unsafe { core::ptr::read_volatile(hva as *const u8) };
         unsafe { core::ptr::write_volatile(hva as *mut u8, GUEST_BRK_INSN as u8) };
-        return Ok(saved as u32);
+        Ok(saved as u32)
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
@@ -390,7 +422,7 @@ fn restore_guest_breakpoint(hva: usize, saved_insn: u32) -> Result<(), &'static 
     #[cfg(target_arch = "x86_64")]
     {
         unsafe { core::ptr::write_volatile(hva as *mut u8, saved_insn as u8) };
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
@@ -424,6 +456,69 @@ fn remember_stale_brk(key: ProbeKey, hva: usize, saved_insn: u32) {
 
 fn clear_stale_brk(key: ProbeKey) {
     STALE_BRK_REGISTRY.lock().remove(&key);
+}
+
+pub fn acquire_return_brk(vm_id: u32, gva: u64, hva: usize) -> Result<(u32, u32), &'static str> {
+    let key = (vm_id, gva);
+    let mut registry = RETURN_BRK_REFCOUNT.lock();
+    if let Some(state) = registry.get_mut(&key) {
+        if state.hva != hva {
+            return Err("return BRK HVA mismatch");
+        }
+        state.refcount = state.refcount.saturating_add(1);
+        return Ok((state.refcount, state.saved_insn));
+    }
+
+    let saved_insn = inject_guest_breakpoint(hva)?;
+    registry.insert(
+        key,
+        ReturnBrkState {
+            refcount: 1,
+            hva,
+            saved_insn,
+        },
+    );
+    Ok((1, saved_insn))
+}
+
+pub fn release_return_brk(vm_id: u32, gva: u64) -> Result<bool, &'static str> {
+    let key = (vm_id, gva);
+    let mut registry = RETURN_BRK_REFCOUNT.lock();
+    let state = registry.get_mut(&key).ok_or("return BRK not found")?;
+    if state.refcount <= 1 {
+        registry.remove(&key);
+        return Ok(false);
+    }
+    state.refcount -= 1;
+    Ok(true)
+}
+
+pub fn cleanup_return_brk(vm_id: u32, gva: u64) -> Result<(), &'static str> {
+    let key = (vm_id, gva);
+    let state = RETURN_BRK_REFCOUNT.lock().remove(&key);
+    let Some(state) = state else {
+        return Ok(());
+    };
+    restore_guest_breakpoint(state.hva, state.saved_insn)
+}
+
+pub fn cleanup_return_brks_for_vm(vm_id: u32) {
+    let keys: Vec<ProbeKey> = RETURN_BRK_REFCOUNT
+        .lock()
+        .keys()
+        .filter(|&&(vid, _)| vid == vm_id)
+        .copied()
+        .collect();
+    for (_, gva) in keys {
+        if let Err(e) = cleanup_return_brk(vm_id, gva) {
+            log::warn!(
+                "guest_kprobe: cleanup return BRK vm{}:{:#x} failed: {}",
+                vm_id,
+                gva,
+                e
+            );
+        }
+    }
 }
 
 // === Module-level convenience functions ===
@@ -516,7 +611,32 @@ pub fn try_enable_registered_for_vm(vm_id: u32) -> usize {
 }
 
 pub fn detach(vm_id: u32, gva: u64) -> Result<(), &'static str> {
-    unregister(vm_id, gva)
+    let is_ret = {
+        let registry = GUEST_KPROBE_REGISTRY.lock();
+        registry
+            .as_ref()
+            .and_then(|r| r.lookup(vm_id, gva))
+            .map(|entry| entry.is_ret)
+            .unwrap_or(false)
+    };
+
+    unregister(vm_id, gva)?;
+
+    if is_ret {
+        let cleared = super::return_stack::clear_for_vm_probe(vm_id, gva);
+        for entry in cleared {
+            if let Err(e) = cleanup_return_brk(vm_id, entry.return_gva) {
+                log::warn!(
+                    "guest_kprobe: cleanup return BRK vm{}:{:#x} failed: {}",
+                    vm_id,
+                    entry.return_gva,
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Detach and unregister all guest kprobes for one VM.
@@ -559,6 +679,8 @@ pub fn detach_all_for_vm(vm_id: u32) -> usize {
     if removed > 0 {
         log::info!("guest_kprobe: detached {} probes for vm{}", removed, vm_id);
     }
+    super::return_stack::clear_for_vm(vm_id);
+    cleanup_return_brks_for_vm(vm_id);
     removed
 }
 
@@ -619,25 +741,34 @@ pub fn clear_stale_brk_for_test() {
 }
 
 #[cfg(any(test, feature = "test-utils"))]
+pub fn clear_return_brk_for_test() {
+    RETURN_BRK_REFCOUNT.lock().clear();
+}
+
+#[cfg(any(test, feature = "test-utils"))]
 pub fn install_mock_backend_fail_on_enable(vm_id: u32, gva: u64) {
     *MOCK_FAIL_ENABLE_TARGET.lock() = Some((vm_id, gva));
 }
 
-pub fn list_all() -> Vec<(u32, u64, Option<String>, u64, bool, bool, u32, KprobeMode)> {
+pub fn list_all() -> Vec<GuestKprobeListEntry> {
     let registry = GUEST_KPROBE_REGISTRY.lock();
     match registry.as_ref() {
-        Some(r) => r.list().iter().map(|e| {
-            (
-                e.vm_id,
-                e.gva,
-                e.symbol.clone(),
-                e.hits,
-                e.state == GuestKprobeState::Enabled,
-                e.is_ret,
-                e.prog_id,
-                e.mode,
-            )
-        }).collect(),
+        Some(r) => r
+            .list()
+            .iter()
+            .map(|e| {
+                (
+                    e.vm_id,
+                    e.gva,
+                    e.symbol.clone(),
+                    e.hits,
+                    e.state == GuestKprobeState::Enabled,
+                    e.is_ret,
+                    e.prog_id,
+                    e.mode,
+                )
+            })
+            .collect(),
         None => Vec::new(),
     }
 }
@@ -736,9 +867,14 @@ pub fn reinject_brk(hva: usize) -> Result<(), &'static str> {
     {
         unsafe { core::ptr::write_volatile(hva as *mut u32, GUEST_BRK_INSN) };
         crate::cache::flush_icache_range(hva, hva + core::mem::size_of::<u32>());
-        return Ok(());
+        Ok(())
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { core::ptr::write_volatile(hva as *mut u8, GUEST_BRK_INSN as u8) };
+        Ok(())
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         let _ = hva;
         Err("reinject_brk not supported on this architecture")

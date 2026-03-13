@@ -11,8 +11,7 @@ use axebpf::maps::{self, MapDef, MapType};
 
 #[test]
 fn test_supported_helpers_count() {
-    // Phase 2 requires 6 standard helpers
-    assert_eq!(SUPPORTED_HELPERS.len(), 6);
+    assert_eq!(SUPPORTED_HELPERS.len(), 9);
 }
 
 #[test]
@@ -95,21 +94,25 @@ fn test_map_helpers_integration() {
 
     let key: u64 = 42;
     let value: u64 = 12345;
+    let key_ptr = (&key as *const u64).cast::<u8>() as u64;
+    let value_ptr = (&value as *const u64).cast::<u8>() as u64;
 
     // Test update helper
-    let result = update_fn(map_id as u64, key, value, 0, 0);
+    let result = update_fn(map_id as u64, key_ptr, value_ptr, 0, 0);
     assert_eq!(result, 0); // Success
 
     // Test lookup helper
-    let result = lookup_fn(map_id as u64, key, 0, 0, 0);
-    assert_eq!(result, 12345);
+    let result = lookup_fn(map_id as u64, key_ptr, 0, 0, 0);
+    assert_ne!(result, 0);
+    let looked_up = unsafe { core::ptr::read_unaligned(result as *const u64) };
+    assert_eq!(looked_up, 12345);
 
     // Test delete helper
-    let result = delete_fn(map_id as u64, key, 0, 0, 0);
+    let result = delete_fn(map_id as u64, key_ptr, 0, 0, 0);
     assert_eq!(result, 0); // Success
 
     // Verify deleted
-    let result = lookup_fn(map_id as u64, key, 0, 0, 0);
+    let result = lookup_fn(map_id as u64, key_ptr, 0, 0, 0);
     assert_eq!(result, 0); // Not found
 }
 

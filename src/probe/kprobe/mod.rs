@@ -9,6 +9,7 @@
 //! - BRK injection (advanced): write BRK instruction directly into guest memory
 
 pub mod addr_translate;
-pub mod manager;
 pub mod handler;
+pub mod manager;
+pub mod return_stack;
 pub mod single_step;

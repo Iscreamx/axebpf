@@ -1,9 +1,10 @@
 #![cfg(feature = "guest-kprobe")]
 
-use axebpf::probe::kprobe::manager::{self, KprobeMode};
 use axebpf::probe::kprobe::addr_translate::{
     register_guest_pt_read_hook, register_gva_to_hva_hook, register_vm_ttbr1_hook,
 };
+use axebpf::probe::kprobe::manager::{self, KprobeMode};
+use axebpf::probe::kprobe::return_stack::{self, ReturnEntry};
 use axerrno::AxResult;
 use std::sync::{
     Mutex, MutexGuard, OnceLock,
@@ -67,7 +68,11 @@ fn setup_stage2_backends() {
     manager::register_stage2_exec_hook(mock_stage2_exec);
     manager::register_stage2_exec_region_hook(mock_stage2_exec_region);
     #[cfg(feature = "test-utils")]
-    manager::clear_stale_brk_for_test();
+    {
+        manager::clear_stale_brk_for_test();
+        manager::clear_return_brk_for_test();
+        return_stack::clear_all_for_test();
+    }
 }
 
 fn setup_deferred_stage2_backends() {
@@ -76,13 +81,53 @@ fn setup_deferred_stage2_backends() {
     manager::register_stage2_exec_hook(mock_stage2_exec);
     manager::register_stage2_exec_region_hook(mock_stage2_exec_region);
     #[cfg(feature = "test-utils")]
-    manager::clear_stale_brk_for_test();
+    {
+        manager::clear_stale_brk_for_test();
+        manager::clear_return_brk_for_test();
+        return_stack::clear_all_for_test();
+    }
 }
 
 static mut MOCK_GUEST_TEXT: [u8; 4] = [0x78, 0x56, 0x34, 0x12];
+static mut MOCK_RETURN_TEXT: [u8; 4] = [0xc0, 0x03, 0x5f, 0xd6];
 
-fn mock_gva_to_hva(_gva: u64, _vm_id: u32) -> AxResult<usize> {
+const RETURN_ADDR_GVA: u64 = 0xffff_8000_0002_0000;
+const ENTRY_ADDR_GVA: u64 = 0xffff_8000_8000_a000;
+
+fn mock_gva_to_hva(gva: u64, _vm_id: u32) -> AxResult<usize> {
+    if gva == RETURN_ADDR_GVA {
+        return Ok(core::ptr::addr_of_mut!(MOCK_RETURN_TEXT) as usize);
+    }
     Ok(core::ptr::addr_of_mut!(MOCK_GUEST_TEXT) as usize)
+}
+
+fn reset_mock_guest_text() {
+    unsafe {
+        MOCK_GUEST_TEXT = [0x78, 0x56, 0x34, 0x12];
+        #[cfg(target_arch = "aarch64")]
+        {
+            MOCK_RETURN_TEXT = [0xc0, 0x03, 0x5f, 0xd6];
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            MOCK_RETURN_TEXT = [0xc3, 0x90, 0x90, 0x90];
+        }
+    }
+}
+
+fn read_return_text() -> [u8; 4] {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(MOCK_RETURN_TEXT)) }
+}
+
+fn expected_return_text() -> [u8; 4] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        [0xc0, 0x03, 0x5f, 0xd6]
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        [0xc3, 0x90, 0x90, 0x90]
+    }
 }
 
 #[cfg(feature = "test-utils")]
@@ -303,4 +348,77 @@ fn brk_attach_before_ttbr1_ready_must_patch_after_retry() {
 
     manager::detach(vm_id, gva).unwrap();
     DEFERRED_TTBR1_READY.store(true, Ordering::Release);
+}
+
+#[cfg(feature = "test-utils")]
+#[test]
+fn detach_is_ret_must_cleanup_pending_return_state() {
+    let _guard = test_guard();
+    manager::init();
+    setup_stage2_backends();
+    register_gva_to_hva_hook(mock_gva_to_hva);
+    reset_mock_guest_text();
+
+    let vm_id = 15;
+    let _ = manager::detach(vm_id, ENTRY_ADDR_GVA);
+
+    manager::attach(vm_id, ENTRY_ADDR_GVA, 20, true, KprobeMode::BrkInject).unwrap();
+
+    let ret_hva = mock_gva_to_hva(RETURN_ADDR_GVA, vm_id).unwrap();
+    let (_refcount, saved_insn) =
+        manager::acquire_return_brk(vm_id, RETURN_ADDR_GVA, ret_hva).unwrap();
+    return_stack::push(
+        0,
+        ReturnEntry {
+            vm_id,
+            return_gva: RETURN_ADDR_GVA,
+            return_hva: ret_hva,
+            saved_insn,
+            entry_gva: ENTRY_ADDR_GVA,
+            prog_id: 20,
+        },
+    )
+    .unwrap();
+
+    manager::detach(vm_id, ENTRY_ADDR_GVA).unwrap();
+
+    assert!(!return_stack::has_pending(0, vm_id, RETURN_ADDR_GVA));
+    assert_eq!(read_return_text(), expected_return_text());
+}
+
+#[cfg(feature = "test-utils")]
+#[test]
+fn detach_all_for_vm_must_cleanup_pending_return_state() {
+    let _guard = test_guard();
+    manager::init();
+    setup_stage2_backends();
+    register_gva_to_hva_hook(mock_gva_to_hva);
+    reset_mock_guest_text();
+
+    let vm_id = 16;
+    let _ = manager::detach(vm_id, ENTRY_ADDR_GVA);
+
+    manager::attach(vm_id, ENTRY_ADDR_GVA, 21, true, KprobeMode::BrkInject).unwrap();
+
+    let ret_hva = mock_gva_to_hva(RETURN_ADDR_GVA, vm_id).unwrap();
+    let (_refcount, saved_insn) =
+        manager::acquire_return_brk(vm_id, RETURN_ADDR_GVA, ret_hva).unwrap();
+    return_stack::push(
+        0,
+        ReturnEntry {
+            vm_id,
+            return_gva: RETURN_ADDR_GVA,
+            return_hva: ret_hva,
+            saved_insn,
+            entry_gva: ENTRY_ADDR_GVA,
+            prog_id: 21,
+        },
+    )
+    .unwrap();
+
+    let removed = manager::detach_all_for_vm(vm_id);
+
+    assert_eq!(removed, 1);
+    assert!(!return_stack::has_pending(0, vm_id, RETURN_ADDR_GVA));
+    assert_eq!(read_return_text(), expected_return_text());
 }

@@ -136,8 +136,9 @@ manager::register_stage2_exec_hook(stage2_exec_hook);
 manager::attach(vm_id, gva, prog_id, false, KprobeMode::BrkInject)?;
 
 // 4) In trap/exit path, dispatch events to handler
-let _ = handler::handle_guest_brk(vm_id, pc, iss);
-let _ = handler::handle_stage2_exec_fault(vm_id, gpa, gva, true);
+let guest_regs = [0u64; 8];
+let _ = handler::handle_guest_brk(vm_id, pc, iss, &guest_regs);
+let _ = handler::handle_stage2_exec_fault(vm_id, gpa, gva, true, &guest_regs);
 
 // 5) Detach when finished
 manager::detach(vm_id, gva)?;

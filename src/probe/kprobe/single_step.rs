@@ -17,6 +17,8 @@ pub enum SingleStepMode {
     BrkInject,
     /// Complete a Stage-2 fault probe by restoring execute-never after one instruction.
     Stage2Fault,
+    /// Complete a return probe by optionally re-injecting the dynamic return BRK.
+    ReturnProbe { should_reinject: bool },
 }
 
 /// Per-vCPU single-step tracking.
@@ -64,7 +66,11 @@ pub fn take_pending(cpu: usize) -> Option<KprobeSingleStepState> {
 
 /// Read pending single-step state without consuming it.
 pub fn peek_pending(cpu: usize) -> Option<KprobeSingleStepState> {
-    SS_STATE.lock().get(&cpu).copied().filter(|state| state.active)
+    SS_STATE
+        .lock()
+        .get(&cpu)
+        .copied()
+        .filter(|state| state.active)
 }
 
 /// Clear pending single-step state for a CPU.
@@ -86,20 +92,17 @@ pub fn is_stepping_on_page(vm_id: u32, gpa: u64) -> bool {
     if gpa == 0 {
         return false;
     }
-    SS_STATE
-        .lock()
-        .values()
-        .any(|state| {
-            if !state.active || state.vm_id != vm_id || state.gpa == 0 {
-                return false;
-            }
-            let size = if state.gpa_size == 0 {
-                0x1000
-            } else {
-                state.gpa_size
-            };
-            gpa >= state.gpa && gpa < state.gpa.saturating_add(size)
-        })
+    SS_STATE.lock().values().any(|state| {
+        if !state.active || state.vm_id != vm_id || state.gpa == 0 {
+            return false;
+        }
+        let size = if state.gpa_size == 0 {
+            0x1000
+        } else {
+            state.gpa_size
+        };
+        gpa >= state.gpa && gpa < state.gpa.saturating_add(size)
+    })
 }
 
 #[cfg(any(test, feature = "test-utils"))]

@@ -4,7 +4,7 @@
 //! guest kernel probing from the VMM.
 
 #[cfg(all(feature = "runtime", feature = "tracepoint-support"))]
-fn emit_guest_event(vm_id: u32, pc_or_gva: u64, is_ret: bool, regs: &[u64; 8]) {
+fn emit_guest_event(vm_id: u32, pc_or_gva: u64, is_ret: bool, regs: &[u64; 31]) {
     let probe_type = if is_ret {
         crate::event::PROBE_KRETPROBE
     } else {
@@ -23,19 +23,27 @@ fn emit_guest_event(vm_id: u32, pc_or_gva: u64, is_ret: bool, regs: &[u64; 8]) {
 }
 
 #[cfg(feature = "runtime")]
+fn guest_arg_regs(regs: &[u64; 31]) -> [u64; 8] {
+    [
+        regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7],
+    ]
+}
+
+#[cfg(feature = "runtime")]
 fn build_guest_ctx(
     vm_id: u32,
     is_ret: bool,
     a0: u64,
     a1: u64,
-    regs: &[u64; 8],
+    regs: &[u64; 31],
 ) -> crate::TraceContext {
     let probe_type = if is_ret { 3 } else { 2 };
+    let regs = guest_arg_regs(regs);
     crate::TraceContext::new(0)
         .with_vm(vm_id, 0)
         .with_args(a0, a1, 0, 0)
         .with_probe_type(probe_type)
-        .with_regs(regs)
+        .with_regs(&regs)
 }
 
 #[cfg(all(feature = "runtime", feature = "guest-kprobe"))]
@@ -44,7 +52,7 @@ pub fn build_guest_ctx_for_test(
     is_ret: bool,
     a0: u64,
     a1: u64,
-    regs: &[u64; 8],
+    regs: &[u64; 31],
 ) -> crate::TraceContext {
     build_guest_ctx(vm_id, is_ret, a0, a1, regs)
 }
@@ -59,6 +67,8 @@ pub enum GuestBrkHandleResult {
     ProbeHitFallbackSkip,
     /// The BRK was stale after detach; caller should retry at current PC.
     RetryInstruction,
+    /// A dynamic return-probe BRK was hit and single-step is armed.
+    ReturnProbeHitSingleStep,
     /// Not a guest-kprobe BRK.
     Unhandled,
 }
@@ -90,7 +100,7 @@ pub fn handle_stage2_exec_fault(
     gpa: u64,
     gva: u64,
     is_exec: bool,
-    regs: &[u64; 8],
+    regs: &[u64; 31],
 ) -> Stage2ExecFaultResult {
     if !is_exec {
         return Stage2ExecFaultResult::Unhandled;
@@ -165,8 +175,8 @@ pub fn handle_stage2_exec_fault(
             prog_id
         );
 
-        let (barrier_gpa, barrier_size) = super::manager::lookup_stage2_barrier(vm_id, gva)
-            .unwrap_or((gpa & !0xfff, 0x1000));
+        let (barrier_gpa, barrier_size) =
+            super::manager::lookup_stage2_barrier(vm_id, gva).unwrap_or((gpa & !0xfff, 0x1000));
         return arm_stage2_single_step(gva, barrier_gpa, barrier_size);
     }
 
@@ -184,7 +194,9 @@ pub fn handle_stage2_exec_fault(
 
     log::trace!(
         "guest_kprobe: Stage-2 exec fault vm{}:gpa={:#x} gva={:#x}",
-        vm_id, gpa, gva
+        vm_id,
+        gpa,
+        gva
     );
 
     Stage2ExecFaultResult::Unhandled
@@ -228,22 +240,62 @@ pub fn should_busy_retry_gva(vm_id: u32, gva: u64) -> bool {
 ///
 /// # Returns
 /// Handling decision for the caller.
-pub fn handle_guest_brk(
-    vm_id: u32,
-    pc: u64,
-    iss: u64,
-    regs: &[u64; 8],
-) -> GuestBrkHandleResult {
+pub fn handle_guest_brk(vm_id: u32, pc: u64, iss: u64, regs: &[u64; 31]) -> GuestBrkHandleResult {
     if let Some(hit) = super::manager::lookup_enabled_brk_hit(vm_id, pc) {
-        #[cfg(all(feature = "runtime", feature = "tracepoint-support"))]
-        emit_guest_event(vm_id, pc, hit.is_ret, regs);
+        if !hit.is_ret {
+            #[cfg(all(feature = "runtime", feature = "tracepoint-support"))]
+            emit_guest_event(vm_id, pc, false, regs);
 
-        #[cfg(feature = "runtime")]
-        {
-            let mut ctx = build_guest_ctx(vm_id, hit.is_ret, pc, iss, regs);
-            crate::tracepoints::hypervisor_helpers::set_current_context(vm_id, 0, 0);
-            let _ = crate::runtime::run_program(hit.prog_id, Some(ctx.as_bytes_mut()));
-            crate::tracepoints::hypervisor_helpers::clear_current_context();
+            #[cfg(feature = "runtime")]
+            {
+                let mut ctx = build_guest_ctx(vm_id, false, pc, iss, regs);
+                crate::tracepoints::hypervisor_helpers::set_current_context(vm_id, 0, 0);
+                let _ = crate::runtime::run_program(hit.prog_id, Some(ctx.as_bytes_mut()));
+                crate::tracepoints::hypervisor_helpers::clear_current_context();
+            }
+        } else {
+            let return_addr = regs[30];
+            match super::addr_translate::gva_to_hva_for_vm(return_addr, vm_id) {
+                Ok(ret_hva) => {
+                    match super::manager::acquire_return_brk(vm_id, return_addr, ret_hva) {
+                        Ok((_refcount, saved_insn)) => {
+                            let ret_entry = super::return_stack::ReturnEntry {
+                                vm_id,
+                                return_gva: return_addr,
+                                return_hva: ret_hva,
+                                saved_insn,
+                                entry_gva: pc,
+                                prog_id: hit.prog_id,
+                            };
+                            let cpu_id = crate::platform::cpu_id() as usize;
+                            if let Err(e) = super::return_stack::push(cpu_id, ret_entry) {
+                                log::warn!(
+                                    "guest_kprobe: return stack push failed vm{}:{:#x}: {}",
+                                    vm_id,
+                                    return_addr,
+                                    e
+                                );
+                                let _ = super::manager::release_return_brk(vm_id, return_addr);
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "guest_kprobe: acquire return BRK failed vm{}:{:#x}: {}",
+                                vm_id,
+                                return_addr,
+                                e
+                            );
+                        }
+                    }
+                }
+                Err(_) => {
+                    log::warn!(
+                        "guest_kprobe: return addr GVA->HVA failed vm{}:{:#x}",
+                        vm_id,
+                        return_addr
+                    );
+                }
+            }
         }
 
         let step_gpa = match hit.gpa {
@@ -269,14 +321,17 @@ pub fn handle_guest_brk(
             mode: super::single_step::SingleStepMode::BrkInject,
         };
         if let Err(e) = super::single_step::set_pending(cpu_id, state) {
-            log::warn!("guest_kprobe: failed to set single-step pending state: {}", e);
-            if step_gpa != 0 {
-                if let Err(clear_err) = super::manager::set_stage2_executable(vm_id, step_gpa, true) {
-                    log::warn!(
-                        "guest_kprobe: failed to clear XN after pending-state failure: {}",
-                        clear_err
-                    );
-                }
+            log::warn!(
+                "guest_kprobe: failed to set single-step pending state: {}",
+                e
+            );
+            if step_gpa != 0
+                && let Err(clear_err) = super::manager::set_stage2_executable(vm_id, step_gpa, true)
+            {
+                log::warn!(
+                    "guest_kprobe: failed to clear XN after pending-state failure: {}",
+                    clear_err
+                );
             }
             return GuestBrkHandleResult::ProbeHitFallbackSkip;
         }
@@ -284,13 +339,13 @@ pub fn handle_guest_brk(
         if let Err(e) = super::manager::restore_insn_for_step(hit.hva, hit.saved_insn) {
             log::warn!("guest_kprobe: failed to restore insn for step: {}", e);
             let _ = super::single_step::clear_pending(cpu_id);
-            if step_gpa != 0 {
-                if let Err(clear_err) = super::manager::set_stage2_executable(vm_id, step_gpa, true) {
-                    log::warn!(
-                        "guest_kprobe: failed to clear XN after restore failure: {}",
-                        clear_err
-                    );
-                }
+            if step_gpa != 0
+                && let Err(clear_err) = super::manager::set_stage2_executable(vm_id, step_gpa, true)
+            {
+                log::warn!(
+                    "guest_kprobe: failed to clear XN after restore failure: {}",
+                    clear_err
+                );
             }
             return GuestBrkHandleResult::ProbeHitFallbackSkip;
         }
@@ -304,6 +359,93 @@ pub fn handle_guest_brk(
         return GuestBrkHandleResult::ProbeHitSingleStep;
     }
 
+    let cpu_id = crate::platform::cpu_id() as usize;
+    if let Some(ret_entry) = super::return_stack::pop_matching(cpu_id, vm_id, pc) {
+        #[cfg(all(feature = "runtime", feature = "tracepoint-support"))]
+        emit_guest_event(vm_id, ret_entry.entry_gva, true, regs);
+
+        #[cfg(feature = "runtime")]
+        {
+            let mut ctx = build_guest_ctx(vm_id, true, ret_entry.entry_gva, pc, regs);
+            crate::tracepoints::hypervisor_helpers::set_current_context(vm_id, 0, 0);
+            let _ = crate::runtime::run_program(ret_entry.prog_id, Some(ctx.as_bytes_mut()));
+            crate::tracepoints::hypervisor_helpers::clear_current_context();
+        }
+
+        let should_reinject = match super::manager::release_return_brk(vm_id, pc) {
+            Ok(should_reinject) => should_reinject,
+            Err(e) => {
+                log::warn!(
+                    "guest_kprobe: release return BRK failed vm{}:{:#x}: {}",
+                    vm_id,
+                    pc,
+                    e
+                );
+                false
+            }
+        };
+
+        let (step_gpa, step_gpa_size) = match super::addr_translate::gva_to_gpa_with_vm(pc, vm_id) {
+            Ok(gpa) => {
+                let (barrier_gpa, barrier_size) = super::manager::query_step_barrier(vm_id, gpa);
+                match super::manager::set_stage2_executable(vm_id, barrier_gpa, false) {
+                    Ok(()) => (barrier_gpa, barrier_size),
+                    Err(e) => {
+                        log::warn!(
+                            "guest_kprobe: failed to set XN for return probe step: {}",
+                            e
+                        );
+                        (0, 0)
+                    }
+                }
+            }
+            Err(_) => (0, 0),
+        };
+
+        let state = super::single_step::KprobeSingleStepState {
+            active: true,
+            probe_gva: pc,
+            saved_insn: ret_entry.saved_insn,
+            vm_id,
+            hva: ret_entry.return_hva,
+            gpa: step_gpa,
+            gpa_size: step_gpa_size,
+            mode: super::single_step::SingleStepMode::ReturnProbe { should_reinject },
+        };
+        if let Err(e) = super::single_step::set_pending(cpu_id, state) {
+            log::warn!(
+                "guest_kprobe: failed to set return probe single-step pending: {}",
+                e
+            );
+            if step_gpa != 0 {
+                let _ = super::manager::set_stage2_executable(vm_id, step_gpa, true);
+            }
+            return GuestBrkHandleResult::Unhandled;
+        }
+
+        if let Err(e) =
+            super::manager::restore_insn_for_step(ret_entry.return_hva, ret_entry.saved_insn)
+        {
+            log::warn!(
+                "guest_kprobe: failed to restore insn for return probe step: {}",
+                e
+            );
+            let _ = super::single_step::clear_pending(cpu_id);
+            if step_gpa != 0 {
+                let _ = super::manager::set_stage2_executable(vm_id, step_gpa, true);
+            }
+            return GuestBrkHandleResult::Unhandled;
+        }
+
+        log::debug!(
+            "guest_kprobe: return probe hit vm{}:{:#x}, pending single-step on cpu{}",
+            vm_id,
+            pc,
+            cpu_id
+        );
+        return GuestBrkHandleResult::ReturnProbeHitSingleStep;
+    }
+
     if super::manager::consume_stale_brk(vm_id, pc) {
         log::debug!("guest_kprobe: recovered stale BRK vm{} pc={:#x}", vm_id, pc);
         return GuestBrkHandleResult::RetryInstruction;
@@ -311,7 +453,9 @@ pub fn handle_guest_brk(
 
     log::trace!(
         "guest_kprobe: guest BRK vm{}:pc={:#x} iss={:#x}",
-        vm_id, pc, iss
+        vm_id,
+        pc,
+        iss
     );
 
     GuestBrkHandleResult::Unhandled
@@ -335,28 +479,46 @@ pub fn handle_software_step() -> bool {
                     e
                 );
             }
-            if state.gpa != 0 {
-                if let Err(e) = super::manager::set_stage2_executable(state.vm_id, state.gpa, true) {
-                    log::warn!(
-                        "guest_kprobe: failed to clear XN after step vm{}:gpa={:#x}: {}",
-                        state.vm_id,
-                        state.gpa,
-                        e
-                    );
-                }
+            if state.gpa != 0
+                && let Err(e) = super::manager::set_stage2_executable(state.vm_id, state.gpa, true)
+            {
+                log::warn!(
+                    "guest_kprobe: failed to clear XN after step vm{}:gpa={:#x}: {}",
+                    state.vm_id,
+                    state.gpa,
+                    e
+                );
             }
         }
         super::single_step::SingleStepMode::Stage2Fault => {
-            if state.gpa != 0 {
-                if let Err(e) = super::manager::set_stage2_executable(state.vm_id, state.gpa, false)
-                {
-                    log::warn!(
-                        "guest_kprobe: failed to restore XN after step vm{}:gpa={:#x}: {}",
-                        state.vm_id,
-                        state.gpa,
-                        e
-                    );
-                }
+            if state.gpa != 0
+                && let Err(e) = super::manager::set_stage2_executable(state.vm_id, state.gpa, false)
+            {
+                log::warn!(
+                    "guest_kprobe: failed to restore XN after step vm{}:gpa={:#x}: {}",
+                    state.vm_id,
+                    state.gpa,
+                    e
+                );
+            }
+        }
+        super::single_step::SingleStepMode::ReturnProbe { should_reinject } => {
+            if should_reinject && let Err(e) = super::manager::reinject_brk(state.hva) {
+                log::warn!(
+                    "guest_kprobe: failed to reinject return BRK at hva={:#x}: {}",
+                    state.hva,
+                    e
+                );
+            }
+            if state.gpa != 0
+                && let Err(e) = super::manager::set_stage2_executable(state.vm_id, state.gpa, true)
+            {
+                log::warn!(
+                    "guest_kprobe: failed to clear XN after return probe step vm{}:gpa={:#x}: {}",
+                    state.vm_id,
+                    state.gpa,
+                    e
+                );
             }
         }
     }
@@ -378,6 +540,15 @@ pub fn handle_software_step() -> bool {
                 state.vm_id,
                 state.probe_gva,
                 cpu_id
+            );
+        }
+        super::single_step::SingleStepMode::ReturnProbe { should_reinject } => {
+            log::info!(
+                "guest_kprobe: return probe single-step complete vm{}:{:#x} on cpu{}, reinject={}",
+                state.vm_id,
+                state.probe_gva,
+                cpu_id,
+                should_reinject
             );
         }
     }
