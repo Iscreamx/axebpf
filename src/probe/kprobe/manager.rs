@@ -319,8 +319,10 @@ impl GuestKprobeRegistry {
     pub fn record_hit(&mut self, vm_id: u32, gva: u64) {
         if let Some(entry) = self.probes.get_mut(&(vm_id, gva)) {
             entry.hits += 1;
+            log_hit_progress(entry);
         } else if let Some(entry) = self.probes.get_mut(&(0, gva)) {
             entry.hits += 1;
+            log_hit_progress(entry);
         }
     }
 
@@ -363,6 +365,31 @@ impl GuestKprobeRegistry {
         }
 
         enabled
+    }
+}
+
+fn log_hit_progress(entry: &GuestKprobeEntry) {
+    if !entry.hits.is_power_of_two() {
+        return;
+    }
+
+    let kind = if entry.is_ret { "kretprobe" } else { "kprobe" };
+    if let Some(symbol) = entry.symbol.as_deref() {
+        log::info!(
+            "guest_kprobe_hits: {} vm{}:{} hits={}",
+            kind,
+            entry.vm_id,
+            symbol,
+            entry.hits
+        );
+    } else {
+        log::info!(
+            "guest_kprobe_hits: {} vm{}:{:#x} hits={}",
+            kind,
+            entry.vm_id,
+            entry.gva,
+            entry.hits
+        );
     }
 }
 
@@ -833,6 +860,7 @@ pub fn lookup_enabled_brk_hit(vm_id: u32, gva: u64) -> Option<BrkProbeHitInfo> {
         _ => return None,
     };
     entry.hits = entry.hits.saturating_add(1);
+    log_hit_progress(entry);
     Some(BrkProbeHitInfo {
         prog_id: entry.prog_id,
         is_ret: entry.is_ret,

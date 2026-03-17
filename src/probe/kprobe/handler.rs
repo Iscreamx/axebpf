@@ -168,7 +168,7 @@ pub fn handle_stage2_exec_fault(
             crate::tracepoints::hypervisor_helpers::clear_current_context();
         }
 
-        log::info!(
+        log::debug!(
             "guest_kprobe: matched stage2 fault vm{} gva={:#x} prog_id={}",
             vm_id,
             gva,
@@ -183,7 +183,7 @@ pub fn handle_stage2_exec_fault(
     if let Some((probe_gva, barrier_gpa, barrier_size)) =
         super::manager::lookup_enabled_stage2_probe_by_gpa(vm_id, gpa)
     {
-        log::info!(
+        log::debug!(
             "guest_kprobe: stage2 page-step vm{} fault_gva={:#x} probe_gva={:#x}",
             vm_id,
             gva,
@@ -353,7 +353,7 @@ pub fn handle_guest_brk(vm_id: u32, pc: u64, iss: u64, regs: &[u64; 31]) -> Gues
             return GuestBrkHandleResult::ProbeHitFallbackSkip;
         }
 
-        log::info!(
+        log::debug!(
             "guest_kprobe: BRK hit vm{}:{:#x}, pending single-step on cpu{}",
             vm_id,
             pc,
@@ -530,7 +530,7 @@ pub fn handle_software_step() -> bool {
 
     match state.mode {
         super::single_step::SingleStepMode::BrkInject => {
-            log::info!(
+            log::debug!(
                 "guest_kprobe: single-step complete vm{}:{:#x} on cpu{}, BRK reinjected",
                 state.vm_id,
                 state.probe_gva,
@@ -538,7 +538,7 @@ pub fn handle_software_step() -> bool {
             );
         }
         super::single_step::SingleStepMode::Stage2Fault => {
-            log::info!(
+            log::debug!(
                 "guest_kprobe: single-step complete vm{}:{:#x} on cpu{}, XN restored",
                 state.vm_id,
                 state.probe_gva,
@@ -546,7 +546,7 @@ pub fn handle_software_step() -> bool {
             );
         }
         super::single_step::SingleStepMode::ReturnProbe { should_reinject } => {
-            log::info!(
+            log::debug!(
                 "guest_kprobe: return probe single-step complete vm{}:{:#x} on cpu{}, reinject={}",
                 state.vm_id,
                 state.probe_gva,
