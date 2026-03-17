@@ -220,6 +220,8 @@ fn guest_brk_match_must_return_true() {
     let _guard = test_guard();
     manager::init();
     setup_mock_backends();
+    reset_stage2_hook_state();
+    manager::register_stage2_exec_hook(recording_stage2_exec);
     let vm_id = 9;
     let pc = 0xffff_8000_8000_2000_u64;
     let _ = manager::detach(vm_id, pc);
@@ -248,7 +250,21 @@ fn guest_brk_match_must_return_true() {
         SingleStepMode::BrkInject,
         "BRK path must tag pending state with BRK mode"
     );
+
+    let hook_state = match stage2_hook_state().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    assert_eq!(
+        hook_state.calls,
+        vec![(vm_id, expected_gpa & !0x1f_ffff, true)],
+        "BRK path must open execute permission before single-steping the restored instruction"
+    );
+    drop(hook_state);
+
     let _ = single_step::clear_pending(0);
+    reset_stage2_hook_state();
+    manager::register_stage2_exec_hook(mock_stage2_exec);
 
     manager::detach(vm_id, pc).unwrap();
 }
@@ -999,6 +1015,51 @@ fn kretprobe_return_hit_must_return_returnprobehitsinglestep() {
             "return hit must be attributed to the entry probe address"
         );
     }
+}
+
+#[test]
+fn kretprobe_return_hit_must_open_execute_window_before_single_step() {
+    let _guard = test_guard();
+    manager::init();
+    setup_mock_backends();
+    reset_mock_guest_insns();
+    return_stack::clear_all_for_test();
+    manager::clear_return_brk_for_test();
+    single_step::clear_pending_for_test();
+    reset_stage2_hook_state();
+    manager::register_stage2_exec_hook(recording_stage2_exec);
+
+    let vm_id = 1;
+    let _ = manager::detach(vm_id, ENTRY_ADDR_GVA);
+    manager::attach(vm_id, ENTRY_ADDR_GVA, 12, true, KprobeMode::BrkInject).unwrap();
+
+    let mut regs = [0u64; 31];
+    regs[30] = RETURN_ADDR_GVA;
+    assert_eq!(
+        handler::handle_guest_brk(vm_id, ENTRY_ADDR_GVA, 0, &regs),
+        GuestBrkHandleResult::ProbeHitSingleStep
+    );
+    assert!(handler::handle_software_step());
+
+    reset_stage2_hook_state();
+    let handled = handler::handle_guest_brk(vm_id, RETURN_ADDR_GVA, 0, &regs);
+    assert_eq!(handled, GuestBrkHandleResult::ReturnProbeHitSingleStep);
+
+    let return_gpa =
+        axebpf::probe::kprobe::addr_translate::gva_to_gpa_with_vm(RETURN_ADDR_GVA, vm_id).unwrap();
+    let hook_state = match stage2_hook_state().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    assert_eq!(
+        hook_state.calls,
+        vec![(vm_id, return_gpa & !0x1f_ffff, true)],
+        "return probe must open execute permission before single-steping the restored return instruction"
+    );
+    drop(hook_state);
+
+    reset_stage2_hook_state();
+    manager::register_stage2_exec_hook(mock_stage2_exec);
 }
 
 #[test]

@@ -299,10 +299,13 @@ pub fn handle_guest_brk(vm_id: u32, pc: u64, iss: u64, regs: &[u64; 31]) -> Gues
         }
 
         let step_gpa = match hit.gpa {
-            Some(gpa) => match super::manager::set_stage2_executable(vm_id, gpa, false) {
+            Some(gpa) => match super::manager::set_stage2_executable(vm_id, gpa, true) {
                 Ok(()) => gpa,
                 Err(e) => {
-                    log::warn!("guest_kprobe: failed to set XN for stepping: {}", e);
+                    log::warn!(
+                        "guest_kprobe: failed to open execute window for stepping: {}",
+                        e
+                    );
                     0
                 }
             },
@@ -388,11 +391,11 @@ pub fn handle_guest_brk(vm_id: u32, pc: u64, iss: u64, regs: &[u64; 31]) -> Gues
         let (step_gpa, step_gpa_size) = match super::addr_translate::gva_to_gpa_with_vm(pc, vm_id) {
             Ok(gpa) => {
                 let (barrier_gpa, barrier_size) = super::manager::query_step_barrier(vm_id, gpa);
-                match super::manager::set_stage2_executable(vm_id, barrier_gpa, false) {
+                match super::manager::set_stage2_executable(vm_id, barrier_gpa, true) {
                     Ok(()) => (barrier_gpa, barrier_size),
                     Err(e) => {
                         log::warn!(
-                            "guest_kprobe: failed to set XN for return probe step: {}",
+                            "guest_kprobe: failed to open execute window for return probe step: {}",
                             e
                         );
                         (0, 0)
