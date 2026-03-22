@@ -14,6 +14,8 @@ use spin::RwLock;
 
 type Stage2ExecHook = fn(vm_id: u32, gpa: u64, executable: bool) -> axerrno::AxResult<()>;
 type Stage2ExecRegionHook = fn(vm_id: u32, gpa: u64) -> axerrno::AxResult<(u64, u64)>;
+pub type HiddenProbeCallback =
+    fn(vm_id: u32, probe_gva: u64, current_pc: u64, regs: &[u64; 31], phase: HiddenProbePhase);
 
 /// Guest kprobe injection mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +32,12 @@ pub enum GuestKprobeState {
     Registered,
     Enabled,
     Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HiddenProbePhase {
+    Entry,
+    Return,
 }
 
 #[inline]
@@ -63,6 +71,10 @@ pub struct GuestKprobeEntry {
     pub resolved_gpa_size: Option<u64>,
     /// Resolved host virtual address for BRK mode.
     pub resolved_hva: Option<usize>,
+    /// Internal observer probe; not shown in shell output.
+    pub hidden: bool,
+    /// Optional internal callback for hidden probes.
+    pub hidden_callback: Option<HiddenProbeCallback>,
 }
 
 /// Key for identifying a guest kprobe: (vm_id, gva).
@@ -81,6 +93,12 @@ struct ReturnBrkState {
     refcount: u32,
     hva: usize,
     saved_insn: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RegisterOptions {
+    hidden: bool,
+    hidden_callback: Option<HiddenProbeCallback>,
 }
 
 const STALE_BRK_MAX_ENTRIES: usize = 64;
@@ -111,6 +129,7 @@ pub struct GuestKprobeRegistry {
 pub struct BrkProbeHitInfo {
     pub prog_id: u32,
     pub is_ret: bool,
+    pub hidden: bool,
     pub hva: usize,
     pub saved_insn: u32,
     pub gpa: Option<u64>,
@@ -133,13 +152,14 @@ impl GuestKprobeRegistry {
     }
 
     /// Register a guest kprobe.
-    pub fn register(
+    fn register_inner(
         &mut self,
         vm_id: u32,
         gva: u64,
         prog_id: u32,
         is_ret: bool,
         mode: KprobeMode,
+        options: RegisterOptions,
     ) -> Result<(), &'static str> {
         let key = (vm_id, gva);
         if self.probes.contains_key(&key) {
@@ -160,6 +180,8 @@ impl GuestKprobeRegistry {
             resolved_gpa: None,
             resolved_gpa_size: None,
             resolved_hva: None,
+            hidden: options.hidden,
+            hidden_callback: options.hidden_callback,
         };
 
         self.probes.insert(key, entry);
@@ -171,6 +193,39 @@ impl GuestKprobeRegistry {
             prog_id
         );
         Ok(())
+    }
+
+    /// Register a guest kprobe.
+    pub fn register(
+        &mut self,
+        vm_id: u32,
+        gva: u64,
+        prog_id: u32,
+        is_ret: bool,
+        mode: KprobeMode,
+    ) -> Result<(), &'static str> {
+        self.register_inner(vm_id, gva, prog_id, is_ret, mode, RegisterOptions::default())
+    }
+
+    pub fn register_hidden(
+        &mut self,
+        vm_id: u32,
+        gva: u64,
+        is_ret: bool,
+        mode: KprobeMode,
+        callback: HiddenProbeCallback,
+    ) -> Result<(), &'static str> {
+        self.register_inner(
+            vm_id,
+            gva,
+            0,
+            is_ret,
+            mode,
+            RegisterOptions {
+                hidden: true,
+                hidden_callback: Some(callback),
+            },
+        )
     }
 
     /// Enable a guest kprobe (activate the probe mechanism).
@@ -328,7 +383,7 @@ impl GuestKprobeRegistry {
 
     /// List all guest kprobes.
     pub fn list(&self) -> Vec<&GuestKprobeEntry> {
-        self.probes.values().collect()
+        self.probes.values().filter(|entry| !entry.hidden).collect()
     }
 
     /// Retry enabling probes that were registered before TTBR1_EL1 became ready.
@@ -369,6 +424,9 @@ impl GuestKprobeRegistry {
 }
 
 fn log_hit_progress(entry: &GuestKprobeEntry) {
+    if entry.hidden {
+        return;
+    }
     if !entry.hits.is_power_of_two() {
         return;
     }
@@ -424,7 +482,7 @@ fn inject_guest_breakpoint(hva: usize) -> Result<u32, &'static str> {
         let saved = unsafe { core::ptr::read_volatile(hva as *const u32) };
         unsafe { core::ptr::write_volatile(hva as *mut u32, GUEST_BRK_INSN) };
         crate::cache::flush_icache_range(hva, hva + core::mem::size_of::<u32>());
-        return Ok(saved);
+        Ok(saved)
     }
     #[cfg(target_arch = "x86_64")]
     {
@@ -444,7 +502,7 @@ fn restore_guest_breakpoint(hva: usize, saved_insn: u32) -> Result<(), &'static 
     {
         unsafe { core::ptr::write_volatile(hva as *mut u32, saved_insn) };
         crate::cache::flush_icache_range(hva, hva + core::mem::size_of::<u32>());
-        return Ok(());
+        Ok(())
     }
     #[cfg(target_arch = "x86_64")]
     {
@@ -552,10 +610,17 @@ pub fn cleanup_return_brks_for_vm(vm_id: u32) {
 
 pub fn init() {
     let mut registry = GUEST_KPROBE_REGISTRY.lock();
+    ensure_registry_initialized(&mut registry);
+}
+
+fn ensure_registry_initialized(
+    registry: &mut Option<GuestKprobeRegistry>,
+) -> &mut GuestKprobeRegistry {
     if registry.is_none() {
         *registry = Some(GuestKprobeRegistry::new());
         log::info!("guest_kprobe: subsystem initialized");
     }
+    registry.as_mut().expect("guest kprobe registry must exist")
 }
 
 pub fn register_stage2_exec_hook(f: Stage2ExecHook) {
@@ -584,25 +649,49 @@ pub fn register(
     mode: KprobeMode,
 ) -> Result<(), &'static str> {
     let mut registry = GUEST_KPROBE_REGISTRY.lock();
-    let registry = registry.as_mut().ok_or("guest kprobe not initialized")?;
+    let registry = ensure_registry_initialized(&mut registry);
     registry.register(vm_id, gva, prog_id, is_ret, mode)
+}
+
+pub fn attach_hidden_brk(
+    vm_id: u32,
+    gva: u64,
+    is_ret: bool,
+    callback: HiddenProbeCallback,
+) -> Result<(), &'static str> {
+    let mut registry = GUEST_KPROBE_REGISTRY.lock();
+    let registry = ensure_registry_initialized(&mut registry);
+    registry.register_hidden(vm_id, gva, is_ret, KprobeMode::BrkInject, callback)?;
+    if let Err(e) = registry.enable(vm_id, gva) {
+        if is_ttbr1_not_ready(e) {
+            log::info!(
+                "guest_kprobe: deferred hidden enable vm{}:{:#x} until TTBR1_EL1 is ready",
+                vm_id,
+                gva
+            );
+            return Ok(());
+        }
+        let _ = registry.unregister(vm_id, gva);
+        return Err(e);
+    }
+    Ok(())
 }
 
 pub fn enable(vm_id: u32, gva: u64) -> Result<(), &'static str> {
     let mut registry = GUEST_KPROBE_REGISTRY.lock();
-    let registry = registry.as_mut().ok_or("guest kprobe not initialized")?;
+    let registry = ensure_registry_initialized(&mut registry);
     registry.enable(vm_id, gva)
 }
 
 pub fn disable(vm_id: u32, gva: u64) -> Result<(), &'static str> {
     let mut registry = GUEST_KPROBE_REGISTRY.lock();
-    let registry = registry.as_mut().ok_or("guest kprobe not initialized")?;
+    let registry = ensure_registry_initialized(&mut registry);
     registry.disable(vm_id, gva)
 }
 
 pub fn unregister(vm_id: u32, gva: u64) -> Result<(), &'static str> {
     let mut registry = GUEST_KPROBE_REGISTRY.lock();
-    let registry = registry.as_mut().ok_or("guest kprobe not initialized")?;
+    let registry = ensure_registry_initialized(&mut registry);
     registry.unregister(vm_id, gva)
 }
 
@@ -714,7 +803,7 @@ pub fn detach_all_for_vm(vm_id: u32) -> usize {
 /// Set or clear symbol name for an existing guest kprobe entry.
 pub fn set_symbol(vm_id: u32, gva: u64, symbol: Option<&str>) -> Result<(), &'static str> {
     let mut registry = GUEST_KPROBE_REGISTRY.lock();
-    let registry = registry.as_mut().ok_or("guest kprobe not initialized")?;
+    let registry = ensure_registry_initialized(&mut registry);
     let entry = registry
         .probes
         .get_mut(&(vm_id, gva))
@@ -864,11 +953,40 @@ pub fn lookup_enabled_brk_hit(vm_id: u32, gva: u64) -> Option<BrkProbeHitInfo> {
     Some(BrkProbeHitInfo {
         prog_id: entry.prog_id,
         is_ret: entry.is_ret,
+        hidden: entry.hidden,
         hva,
         saved_insn,
         gpa: entry.resolved_gpa,
         gpa_size: entry.resolved_gpa_size.unwrap_or(0x1000),
     })
+}
+
+pub fn dispatch_hidden_callback(
+    vm_id: u32,
+    probe_gva: u64,
+    current_pc: u64,
+    regs: &[u64; 31],
+    phase: HiddenProbePhase,
+) -> bool {
+    let callback = {
+        let registry = GUEST_KPROBE_REGISTRY.lock();
+        let Some(registry) = registry.as_ref() else {
+            return false;
+        };
+        let Some(entry) = registry.lookup(vm_id, probe_gva) else {
+            return false;
+        };
+        if entry.state != GuestKprobeState::Enabled || !entry.hidden {
+            return false;
+        }
+        entry.hidden_callback
+    };
+
+    if let Some(callback) = callback {
+        callback(vm_id, probe_gva, current_pc, regs, phase);
+        return true;
+    }
+    false
 }
 
 /// Record one hit for an enabled probe.

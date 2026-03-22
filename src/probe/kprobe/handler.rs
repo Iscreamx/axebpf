@@ -243,17 +243,36 @@ pub fn should_busy_retry_gva(vm_id: u32, gva: u64) -> bool {
 pub fn handle_guest_brk(vm_id: u32, pc: u64, iss: u64, regs: &[u64; 31]) -> GuestBrkHandleResult {
     if let Some(hit) = super::manager::lookup_enabled_brk_hit(vm_id, pc) {
         if !hit.is_ret {
-            #[cfg(all(feature = "runtime", feature = "tracepoint-support"))]
-            emit_guest_event(vm_id, pc, false, regs);
+            if hit.hidden {
+                let _ = super::manager::dispatch_hidden_callback(
+                    vm_id,
+                    pc,
+                    pc,
+                    regs,
+                    super::manager::HiddenProbePhase::Entry,
+                );
+            } else {
+                #[cfg(all(feature = "runtime", feature = "tracepoint-support"))]
+                emit_guest_event(vm_id, pc, false, regs);
 
-            #[cfg(feature = "runtime")]
-            {
-                let mut ctx = build_guest_ctx(vm_id, false, pc, iss, regs);
-                crate::tracepoints::hypervisor_helpers::set_current_context(vm_id, 0, 0);
-                let _ = crate::runtime::run_program(hit.prog_id, Some(ctx.as_bytes_mut()));
-                crate::tracepoints::hypervisor_helpers::clear_current_context();
+                #[cfg(feature = "runtime")]
+                {
+                    let mut ctx = build_guest_ctx(vm_id, false, pc, iss, regs);
+                    crate::tracepoints::hypervisor_helpers::set_current_context(vm_id, 0, 0);
+                    let _ = crate::runtime::run_program(hit.prog_id, Some(ctx.as_bytes_mut()));
+                    crate::tracepoints::hypervisor_helpers::clear_current_context();
+                }
             }
         } else {
+            if hit.hidden {
+                let _ = super::manager::dispatch_hidden_callback(
+                    vm_id,
+                    pc,
+                    pc,
+                    regs,
+                    super::manager::HiddenProbePhase::Entry,
+                );
+            }
             let return_addr = regs[30];
             match super::addr_translate::gva_to_hva_for_vm(return_addr, vm_id) {
                 Ok(ret_hva) => {
@@ -364,15 +383,25 @@ pub fn handle_guest_brk(vm_id: u32, pc: u64, iss: u64, regs: &[u64; 31]) -> Gues
 
     let cpu_id = crate::platform::cpu_id() as usize;
     if let Some(ret_entry) = super::return_stack::pop_matching(cpu_id, vm_id, pc) {
-        #[cfg(all(feature = "runtime", feature = "tracepoint-support"))]
-        emit_guest_event(vm_id, ret_entry.entry_gva, true, regs);
+        let hidden = super::manager::dispatch_hidden_callback(
+            vm_id,
+            ret_entry.entry_gva,
+            pc,
+            regs,
+            super::manager::HiddenProbePhase::Return,
+        );
 
-        #[cfg(feature = "runtime")]
-        {
-            let mut ctx = build_guest_ctx(vm_id, true, ret_entry.entry_gva, pc, regs);
-            crate::tracepoints::hypervisor_helpers::set_current_context(vm_id, 0, 0);
-            let _ = crate::runtime::run_program(ret_entry.prog_id, Some(ctx.as_bytes_mut()));
-            crate::tracepoints::hypervisor_helpers::clear_current_context();
+        if !hidden {
+            #[cfg(all(feature = "runtime", feature = "tracepoint-support"))]
+            emit_guest_event(vm_id, ret_entry.entry_gva, true, regs);
+
+            #[cfg(feature = "runtime")]
+            {
+                let mut ctx = build_guest_ctx(vm_id, true, ret_entry.entry_gva, pc, regs);
+                crate::tracepoints::hypervisor_helpers::set_current_context(vm_id, 0, 0);
+                let _ = crate::runtime::run_program(ret_entry.prog_id, Some(ctx.as_bytes_mut()));
+                crate::tracepoints::hypervisor_helpers::clear_current_context();
+            }
         }
 
         let should_reinject = match super::manager::release_return_brk(vm_id, pc) {

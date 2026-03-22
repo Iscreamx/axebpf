@@ -1,8 +1,11 @@
-//! Guest address translation: GVA → GPA → HVA.
+//! Guest user address translation: user VA -> GPA/HVA.
 //!
-//! Walks the guest's page tables (read from TTBR1_EL1 in vCPU context)
-//! and the Stage-2 page tables (managed by axaddrspace) to translate
-//! guest virtual addresses to host virtual addresses accessible by VMM.
+//! The runtime observer needs TTBR0_EL1-driven guest user page-table walking
+//! plus a bounded helper for reading user-space strings.
+
+extern crate alloc;
+
+use alloc::string::String;
 
 use axerrno::AxResult;
 
@@ -15,9 +18,10 @@ const L1_BLOCK_OFFSET_MASK: u64 = (1 << 30) - 1;
 const L2_BLOCK_OFFSET_MASK: u64 = (1 << 21) - 1;
 const L1_BLOCK_ADDR_MASK: u64 = DESC_ADDR_MASK & !L1_BLOCK_OFFSET_MASK;
 const L2_BLOCK_ADDR_MASK: u64 = DESC_ADDR_MASK & !L2_BLOCK_OFFSET_MASK;
+
 type ReadGuestPteFn = fn(paddr: u64, vm_id: u32) -> AxResult<u64>;
+type VmTtbr0Fn = fn(vm_id: u32) -> AxResult<u64>;
 type GpaToHpaFn = fn(gpa: u64, vm_id: u32) -> AxResult<u64>;
-type VmTtbr1Fn = fn(vm_id: u32) -> AxResult<u64>;
 type GvaToHvaFn = fn(gva: u64, vm_id: u32) -> AxResult<usize>;
 
 pub trait GuestPtReader {
@@ -27,9 +31,10 @@ pub trait GuestPtReader {
 struct HookReader {
     vm_id: u32,
 }
+
 static GUEST_PT_READ_HOOK: spin::RwLock<Option<ReadGuestPteFn>> = spin::RwLock::new(None);
+static VM_TTBR0_HOOK: spin::RwLock<Option<VmTtbr0Fn>> = spin::RwLock::new(None);
 static GPA_TO_HPA_HOOK: spin::RwLock<Option<GpaToHpaFn>> = spin::RwLock::new(None);
-static VM_TTBR1_HOOK: spin::RwLock<Option<VmTtbr1Fn>> = spin::RwLock::new(None);
 static GVA_TO_HVA_HOOK: spin::RwLock<Option<GvaToHvaFn>> = spin::RwLock::new(None);
 
 impl GuestPtReader for HookReader {
@@ -62,8 +67,12 @@ fn desc_type(desc: u64) -> u64 {
     desc & DESC_TYPE_MASK
 }
 
-pub fn gva_to_gpa_with<R: GuestPtReader>(reader: &R, gva: u64, ttbr1_el1: u64) -> AxResult<u64> {
-    let l0_base = ttbr1_el1 & DESC_ADDR_MASK;
+pub fn gva_to_gpa_user_with<R: GuestPtReader>(
+    reader: &R,
+    gva: u64,
+    ttbr0_el1: u64,
+) -> AxResult<u64> {
+    let l0_base = ttbr0_el1 & DESC_ADDR_MASK;
 
     let l0 = read_entry(reader, l0_base, table_index(gva, 39))?;
     if !is_valid_desc(l0) || desc_type(l0) != DESC_TABLE_OR_PAGE {
@@ -106,24 +115,6 @@ pub fn gva_to_gpa_with<R: GuestPtReader>(reader: &R, gva: u64, ttbr1_el1: u64) -
     Ok(page_base | (gva & PAGE_OFFSET_MASK))
 }
 
-/// Translates a Guest Virtual Address (GVA) to a Guest Physical Address (GPA)
-/// by walking the guest's EL1 page tables.
-///
-/// # Arguments
-/// * `gva` - Guest virtual address to translate
-/// * `ttbr1_el1` - Guest's TTBR1_EL1 register value (from vCPU context)
-///
-/// # Returns
-/// The corresponding GPA, or error if translation fails.
-pub fn gva_to_gpa(gva: u64, ttbr1_el1: u64) -> AxResult<u64> {
-    gva_to_gpa_for_vm(gva, ttbr1_el1, 0)
-}
-
-pub fn gva_to_gpa_for_vm(gva: u64, ttbr1_el1: u64, vm_id: u32) -> AxResult<u64> {
-    let reader = HookReader { vm_id };
-    gva_to_gpa_with(&reader, gva, ttbr1_el1)
-}
-
 pub fn register_guest_pt_read_hook(f: ReadGuestPteFn) {
     *GUEST_PT_READ_HOOK.write() = Some(f);
 }
@@ -133,13 +124,26 @@ pub fn clear_guest_pt_read_hook_for_test() {
     *GUEST_PT_READ_HOOK.write() = None;
 }
 
-pub fn register_vm_ttbr1_hook(f: VmTtbr1Fn) {
-    *VM_TTBR1_HOOK.write() = Some(f);
+pub fn register_vm_ttbr0_hook(f: VmTtbr0Fn) {
+    *VM_TTBR0_HOOK.write() = Some(f);
 }
 
 #[cfg(any(test, feature = "test-utils"))]
-pub fn clear_vm_ttbr1_hook_for_test() {
-    *VM_TTBR1_HOOK.write() = None;
+pub fn clear_vm_ttbr0_hook_for_test() {
+    *VM_TTBR0_HOOK.write() = None;
+}
+
+pub fn vm_ttbr0_el1(vm_id: u32) -> AxResult<u64> {
+    if let Some(state) = crate::probe::guest_runtime_state::current_live_guest_runtime_state(vm_id)
+        && state.ttbr0_el1 != 0
+    {
+        return Ok(state.ttbr0_el1);
+    }
+    let hook = *VM_TTBR0_HOOK.read();
+    let Some(f) = hook else {
+        return axerrno::ax_err!(Unsupported, "VM TTBR0_EL1 hook not registered");
+    };
+    f(vm_id)
 }
 
 pub fn register_gpa_to_hpa_hook(f: GpaToHpaFn) {
@@ -160,75 +164,62 @@ pub fn clear_gva_to_hva_hook_for_test() {
     *GVA_TO_HVA_HOOK.write() = None;
 }
 
-/// Translates a Guest Physical Address (GPA) to a Host Physical Address (HPA)
-/// by querying the Stage-2 page tables.
-///
-/// # Arguments
-/// * `gpa` - Guest physical address
-/// * `vm_id` - VM identifier to select the correct Stage-2 table
-///
-/// # Returns
-/// The corresponding HPA, or error if not mapped.
-pub fn gpa_to_hpa(gpa: u64, vm_id: u32) -> AxResult<u64> {
+pub fn gva_to_gpa_user_with_vm(gva: u64, vm_id: u32) -> AxResult<u64> {
+    let ttbr0 = vm_ttbr0_el1(vm_id)?;
+    let reader = HookReader { vm_id };
+    gva_to_gpa_user_with(&reader, gva, ttbr0)
+}
+
+fn gpa_to_hpa(gpa: u64, vm_id: u32) -> AxResult<u64> {
     let hook = *GPA_TO_HPA_HOOK.read();
     let Some(f) = hook else {
-        return axerrno::ax_err!(Unsupported, "GPA→HPA hook not registered");
+        return axerrno::ax_err!(Unsupported, "GPA->HPA hook not registered");
     };
     f(gpa, vm_id)
 }
 
-pub fn vm_ttbr1_el1(vm_id: u32) -> AxResult<u64> {
-    if let Some(state) = crate::probe::guest_runtime_state::current_live_guest_runtime_state(vm_id)
-        && state.ttbr1_el1 != 0
-    {
-        return Ok(state.ttbr1_el1);
+pub fn gva_to_hva_user_with_vm(gva: u64, vm_id: u32) -> AxResult<usize> {
+    let direct = *GVA_TO_HVA_HOOK.read();
+    if let Some(f) = direct {
+        return f(gva, vm_id);
     }
-    let hook = *VM_TTBR1_HOOK.read();
-    let Some(f) = hook else {
-        return axerrno::ax_err!(Unsupported, "VM TTBR1_EL1 hook not registered");
-    };
-    f(vm_id)
-}
 
-/// Full translation chain: GVA → GPA → HPA → HVA.
-///
-/// # Arguments
-/// * `gva` - Guest virtual address
-/// * `ttbr1_el1` - Guest's TTBR1_EL1 register value
-/// * `vm_id` - VM identifier
-///
-/// # Returns
-/// Host virtual address that VMM can read/write directly.
-pub fn gva_to_hva(gva: u64, ttbr1_el1: u64, vm_id: u32) -> AxResult<usize> {
-    let gpa = gva_to_gpa_for_vm(gva, ttbr1_el1, vm_id)?;
+    let gpa = gva_to_gpa_user_with_vm(gva, vm_id)?;
     let hpa = gpa_to_hpa(gpa, vm_id)?;
-    // Linear mapping: HVA = phys_to_virt(HPA)
     #[cfg(feature = "axhal")]
     {
-        let hpa_usize = usize::try_from(hpa)
+        let hpa = usize::try_from(hpa)
             .map_err(|_| axerrno::ax_err_type!(InvalidInput, "HPA out of range"))?;
-        Ok(axhal::mem::phys_to_virt(hpa_usize.into()).as_usize())
+        Ok(axhal::mem::phys_to_virt(hpa.into()).as_usize())
     }
     #[cfg(not(feature = "axhal"))]
     {
         let _ = hpa;
         axerrno::ax_err!(
             Unsupported,
-            "GVA→HVA translation needs `axhal` feature for phys_to_virt"
+            "user GVA->HVA translation needs `axhal` feature or direct HVA hook"
         )
     }
 }
 
-pub fn gva_to_gpa_with_vm(gva: u64, vm_id: u32) -> AxResult<u64> {
-    let ttbr1 = vm_ttbr1_el1(vm_id)?;
-    gva_to_gpa_for_vm(gva, ttbr1, vm_id)
-}
-
-pub fn gva_to_hva_for_vm(gva: u64, vm_id: u32) -> AxResult<usize> {
-    let direct = *GVA_TO_HVA_HOOK.read();
-    if let Some(f) = direct {
-        return f(gva, vm_id);
+pub fn read_user_cstring_with_vm(vm_id: u32, user_gva: u64, max_len: usize) -> AxResult<String> {
+    if max_len == 0 {
+        return axerrno::ax_err!(InvalidInput, "max_len must be greater than zero");
     }
-    let ttbr1 = vm_ttbr1_el1(vm_id)?;
-    gva_to_hva(gva, ttbr1, vm_id)
+
+    let mut bytes = alloc::vec::Vec::with_capacity(core::cmp::min(max_len, 256));
+    for idx in 0..max_len {
+        let gva = user_gva
+            .checked_add(idx as u64)
+            .ok_or_else(|| axerrno::ax_err_type!(InvalidInput, "user GVA overflow"))?;
+        let hva = gva_to_hva_user_with_vm(gva, vm_id)?;
+        let byte = unsafe { core::ptr::read_volatile(hva as *const u8) };
+        if byte == 0 {
+            return String::from_utf8(bytes)
+                .map_err(|_| axerrno::ax_err_type!(InvalidData, "user string is not valid UTF-8"));
+        }
+        bytes.push(byte);
+    }
+
+    axerrno::ax_err!(InvalidInput, "user string exceeds max_len or missing NUL")
 }

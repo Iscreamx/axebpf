@@ -92,7 +92,7 @@ fn parse_elf_with_aya(
     // `include_bytes!()` is placed in .rodata with no alignment guarantee,
     // so we must copy to an aligned buffer when the pointer is misaligned.
     let aligned_buf;
-    let parse_data = if (elf_data.as_ptr() as usize) % 8 != 0 {
+    let parse_data = if !(elf_data.as_ptr() as usize).is_multiple_of(8) {
         log::debug!("ELF data not 8-byte aligned (ptr={:#x}), copying to aligned buffer", elf_data.as_ptr() as usize);
         aligned_buf = elf_data.to_vec();
         aligned_buf.as_slice()

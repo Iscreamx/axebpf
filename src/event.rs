@@ -20,6 +20,8 @@ pub const PROBE_HPROBE: u8 = 1;
 pub const PROBE_HRETPROBE: u8 = 2;
 pub const PROBE_KPROBE: u8 = 3;
 pub const PROBE_KRETPROBE: u8 = 4;
+pub const PROBE_UPROBE: u8 = 5;
+pub const PROBE_URETPROBE: u8 = 6;
 
 const PAGE_SIZE: u32 = 4096;
 const DEFAULT_RINGBUF_SIZE: u32 = 64 * 1024;
@@ -98,6 +100,8 @@ impl TraceEvent {
             PROBE_HRETPROBE => "hretprobe",
             PROBE_KPROBE => "kprobe",
             PROBE_KRETPROBE => "kretprobe",
+            PROBE_UPROBE => "uprobe",
+            PROBE_URETPROBE => "uretprobe",
             _ => "unknown",
         }
     }

@@ -26,7 +26,7 @@ pub struct AxKernelAuxOps;
 fn virt_to_phys(vaddr: usize) -> usize {
     #[cfg(feature = "axhal")]
     {
-        return axhal::mem::virt_to_phys(vaddr.into()).as_usize();
+        axhal::mem::virt_to_phys(vaddr.into()).as_usize()
     }
     #[cfg(not(feature = "axhal"))]
     {
@@ -38,7 +38,7 @@ fn virt_to_phys(vaddr: usize) -> usize {
 fn phys_to_virt(paddr: usize) -> usize {
     #[cfg(feature = "axhal")]
     {
-        return axhal::mem::phys_to_virt(paddr.into()).as_usize();
+        axhal::mem::phys_to_virt(paddr.into()).as_usize()
     }
     #[cfg(not(feature = "axhal"))]
     {

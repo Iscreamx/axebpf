@@ -13,6 +13,12 @@ use axebpf::probe::kprobe::addr_translate::{
 
 extern crate alloc;
 
+#[cfg(feature = "test-utils")]
+use std::sync::Mutex;
+
+#[cfg(feature = "test-utils")]
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+
 struct MockPtReader {
     entries: BTreeMap<u64, u64>,
 }
@@ -91,6 +97,24 @@ fn l2_block_walk_translates_gva_to_gpa() {
 }
 
 #[test]
+fn l2_block_walk_ignores_descriptor_attribute_bits() {
+    let mut mock = MockPtReader::new();
+    let ttbr1 = 0x2200_0000_u64;
+    let l1 = 0x2200_1000_u64;
+    let l2 = 0x2200_2000_u64;
+    let gva = 0xffff_8000_0065_4321_u64;
+    let block_base = 0x4780_0000_u64;
+    let xn = 1_u64 << 54;
+
+    mock.insert_entry(ttbr1, l0_index(gva), l1 | 0b11);
+    mock.insert_entry(l1, l1_index(gva), l2 | 0b11);
+    mock.insert_entry(l2, l2_index(gva), block_base | xn | 0b01);
+
+    let gpa = gva_to_gpa_with(&mock, gva, ttbr1).unwrap();
+    assert_eq!(gpa, block_base | (gva & ((1 << 21) - 1)));
+}
+
+#[test]
 fn invalid_descriptor_returns_error() {
     let mut mock = MockPtReader::new();
     let ttbr1 = 0x3000_0000_u64;
@@ -105,6 +129,7 @@ fn invalid_descriptor_returns_error() {
 #[cfg(feature = "test-utils")]
 #[test]
 fn gpa_to_hpa_without_backend_returns_unsupported() {
+    let _guard = TEST_LOCK.lock().unwrap();
     clear_gpa_to_hpa_hook_for_test();
     let err = gpa_to_hpa(0x2000, 1).unwrap_err();
     assert!(matches!(err, axerrno::AxError::Unsupported));
@@ -118,6 +143,7 @@ fn mock_gpa_to_hpa(gpa: u64, vm_id: u32) -> AxResult<u64> {
 #[cfg(feature = "test-utils")]
 #[test]
 fn gpa_to_hpa_uses_registered_backend() {
+    let _guard = TEST_LOCK.lock().unwrap();
     clear_gpa_to_hpa_hook_for_test();
     register_gpa_to_hpa_hook(mock_gpa_to_hpa);
     let hpa = gpa_to_hpa(0x2000, 3).unwrap();
@@ -158,6 +184,7 @@ fn mock_guest_pt_read(paddr: u64, _vm_id: u32) -> AxResult<u64> {
 #[cfg(feature = "test-utils")]
 #[test]
 fn gva_to_gpa_with_vm_uses_registered_ttbr1_and_reader() {
+    let _guard = TEST_LOCK.lock().unwrap();
     clear_vm_ttbr1_hook_for_test();
     clear_guest_pt_read_hook_for_test();
     register_vm_ttbr1_hook(mock_vm_ttbr1);
@@ -179,6 +206,7 @@ fn mock_gva_to_hva(_gva: u64, vm_id: u32) -> AxResult<usize> {
 #[cfg(feature = "test-utils")]
 #[test]
 fn gva_to_hva_for_vm_prefers_direct_hook() {
+    let _guard = TEST_LOCK.lock().unwrap();
     clear_gva_to_hva_hook_for_test();
     register_gva_to_hva_hook(mock_gva_to_hva);
     let hva = gva_to_hva_for_vm(0x1234, 7).unwrap();

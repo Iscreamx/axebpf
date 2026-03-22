@@ -25,7 +25,8 @@ pub struct TraceContext {
     pub arg2: u64,
     /// Tracepoint argument 3
     pub arg3: u64,
-    /// Probe type (0=hprobe, 1=hretprobe, 2=kprobe, 3=kretprobe, 4=tracepoint)
+    /// Probe type
+    /// (0=hprobe, 1=hretprobe, 2=kprobe, 3=kretprobe, 4=tracepoint, 5=uprobe, 6=uretprobe)
     pub probe_type: u32,
     /// Reserved for alignment
     pub _reserved: u32,

@@ -13,6 +13,12 @@ pub mod hprobe;
 #[cfg(feature = "guest-kprobe")]
 pub mod kprobe;
 
+#[cfg(any(feature = "guest-kprobe", feature = "guest-uprobe"))]
+pub mod guest_runtime_state;
+
+#[cfg(feature = "guest-uprobe")]
+pub mod uprobe;
+
 /// Probe type classification by privilege level and direction.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,17 +33,27 @@ pub enum ProbeType {
     Kretprobe = 3,
     /// VMM static instrumentation point
     Tracepoint = 4,
+    /// Guest user function entry
+    Uprobe = 5,
+    /// Guest user function return
+    Uretprobe = 6,
 }
 
 impl ProbeType {
     /// Whether this probe targets guest VM code (vs VMM/host code).
     pub fn is_guest_probe(&self) -> bool {
-        matches!(self, ProbeType::Kprobe | ProbeType::Kretprobe)
+        matches!(
+            self,
+            ProbeType::Kprobe | ProbeType::Kretprobe | ProbeType::Uprobe | ProbeType::Uretprobe
+        )
     }
 
     /// Whether this is a return probe.
     pub fn is_return_probe(&self) -> bool {
-        matches!(self, ProbeType::Hretprobe | ProbeType::Kretprobe)
+        matches!(
+            self,
+            ProbeType::Hretprobe | ProbeType::Kretprobe | ProbeType::Uretprobe
+        )
     }
 
     /// Short label for display.
@@ -48,6 +64,8 @@ impl ProbeType {
             ProbeType::Kprobe => "kprobe",
             ProbeType::Kretprobe => "kretprobe",
             ProbeType::Tracepoint => "tracepoint",
+            ProbeType::Uprobe => "uprobe",
+            ProbeType::Uretprobe => "uretprobe",
         }
     }
 }

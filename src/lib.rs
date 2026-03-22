@@ -62,7 +62,11 @@ pub mod insn_slot;
 #[cfg(feature = "tracepoint-support")]
 pub mod page_table;
 
-#[cfg(any(feature = "hprobe", feature = "guest-kprobe"))]
+#[cfg(any(
+    feature = "hprobe",
+    feature = "guest-kprobe",
+    feature = "guest-uprobe"
+))]
 pub mod probe;
 
 #[cfg(feature = "guest-kprobe")]
@@ -226,7 +230,7 @@ pub fn init_with_symbols(kallsyms_data: &'static [u8], stext: u64, etext: u64) {
     // The ksym library expects the blob to be page-aligned in memory.
     // Check alignment and warn if not aligned.
     let ptr = kallsyms_data.as_ptr() as usize;
-    if ptr % 4096 != 0 {
+    if !ptr.is_multiple_of(4096) {
         warn!("    - kallsyms data is not page-aligned (ptr % 4096 = {})", ptr % 4096);
         warn!("    - this may cause parsing issues with ksym library");
     }
@@ -275,6 +279,8 @@ pub fn init_with_symbols(kallsyms_data: &'static [u8], stext: u64, etext: u64) {
 pub fn cleanup_vm(vm_id: u32) {
     let detached = probe::kprobe::manager::detach_all_for_vm(vm_id);
     guest_symbols::unload(vm_id);
+    #[cfg(feature = "guest-uprobe")]
+    probe::uprobe::object::unload_vm(vm_id);
     info!(
         "axebpf: cleaned up vm{} ({} probes detached)",
         vm_id,
