@@ -29,10 +29,16 @@ pub enum UprobeStage2ExecFaultResult {
 
 #[derive(Debug, Clone, Copy)]
 enum UprobeSingleStepState {
-    ReinjectBrk {
+    ReinjectEntryBrk {
         vm_id: u32,
         pc: u64,
         hva: usize,
+    },
+    ReinjectReturnBrk {
+        vm_id: u32,
+        pc: u64,
+        hva: usize,
+        should_reinject: bool,
     },
     ExecBarrier {
         vm_id: u32,
@@ -112,18 +118,108 @@ pub fn build_uprobe_ctx_for_test(
     build_uprobe_ctx(vm_id, vcpu_id, pid, tgid, mm, is_ret)
 }
 
-pub fn handle_guest_brk(
+fn current_vcpu_id() -> u32 {
+    crate::platform::cpu_id()
+}
+
+fn current_mm(vm_id: u32) -> Option<u64> {
+    super::addr_translate::vm_ttbr0_el1(vm_id).ok()
+}
+
+fn begin_single_step_for_entry(
     vm_id: u32,
     pc: u64,
-    _iss: u64,
-    regs: &[u64; 31],
-    spsr: u64,
+    hva: usize,
+    saved_insn: u32,
 ) -> UprobeBrkHandleResult {
-    if !is_guest_user_mode(spsr) {
-        return UprobeBrkHandleResult::Unhandled;
+    let cpu_id = current_vcpu_id() as usize;
+    {
+        let mut pending = SINGLE_STEP_STATE.lock();
+        if pending.contains_key(&cpu_id) {
+            return UprobeBrkHandleResult::ProbeHitFallbackSkip;
+        }
+        pending.insert(cpu_id, UprobeSingleStepState::ReinjectEntryBrk { vm_id, pc, hva });
     }
 
-    let Some(entry) = super::manager::record_active_hit(vm_id, pc) else {
+    if let Err(err) = super::manager::restore_instruction_for_step(hva, saved_insn) {
+        let _ = SINGLE_STEP_STATE.lock().remove(&cpu_id);
+        log::warn!(
+            "guest_uprobe: failed to restore instruction vm{} pc={:#x}: {}",
+            vm_id,
+            pc,
+            err
+        );
+        return UprobeBrkHandleResult::ProbeHitFallbackSkip;
+    }
+
+    UprobeBrkHandleResult::ProbeHitSingleStep
+}
+
+fn begin_single_step_for_return(
+    vm_id: u32,
+    pc: u64,
+    hva: usize,
+    saved_insn: u32,
+    should_reinject: bool,
+) -> UprobeBrkHandleResult {
+    let cpu_id = current_vcpu_id() as usize;
+    {
+        let mut pending = SINGLE_STEP_STATE.lock();
+        if pending.contains_key(&cpu_id) {
+            return UprobeBrkHandleResult::ProbeHitFallbackSkip;
+        }
+        pending.insert(
+            cpu_id,
+            UprobeSingleStepState::ReinjectReturnBrk {
+                vm_id,
+                pc,
+                hva,
+                should_reinject,
+            },
+        );
+    }
+
+    if let Err(err) = super::manager::restore_instruction_for_step(hva, saved_insn) {
+        let _ = SINGLE_STEP_STATE.lock().remove(&cpu_id);
+        log::warn!(
+            "guest_uretprobe: failed to restore return instruction vm{} pc={:#x}: {}",
+            vm_id,
+            pc,
+            err
+        );
+        return UprobeBrkHandleResult::ProbeHitFallbackSkip;
+    }
+
+    UprobeBrkHandleResult::ProbeHitSingleStep
+}
+
+#[cfg(feature = "runtime")]
+fn run_uprobe_program(
+    entry: &super::manager::ActiveUprobeEntry,
+    vcpu_id: u32,
+    regs: &[u64; 31],
+) {
+    let regs = guest_arg_regs(regs);
+    let mut ctx = build_uprobe_ctx(
+        entry.vm_id,
+        vcpu_id,
+        entry.pid,
+        entry.tgid,
+        entry.mm,
+        entry.is_ret,
+    )
+    .with_regs(&regs);
+    crate::tracepoints::hypervisor_helpers::set_current_context(entry.vm_id, vcpu_id, 0);
+    let _ = crate::runtime::run_program(entry.prog_id, Some(ctx.as_bytes_mut()));
+    crate::tracepoints::hypervisor_helpers::clear_current_context();
+}
+
+fn handle_guest_uprobe_hit(
+    vm_id: u32,
+    pc: u64,
+    regs: &[u64; 31],
+) -> UprobeBrkHandleResult {
+    let Some(entry) = super::manager::increment_active_hits(vm_id, pc) else {
         return UprobeBrkHandleResult::Unhandled;
     };
     log::info!(
@@ -143,45 +239,181 @@ pub fn handle_guest_brk(
     emit_uprobe_event(&entry, pc);
 
     #[cfg(feature = "runtime")]
-    {
-        let regs = guest_arg_regs(regs);
-        let mut ctx =
-            build_uprobe_ctx(entry.vm_id, 0, entry.pid, entry.tgid, entry.mm, entry.is_ret)
-                .with_regs(&regs);
-        crate::tracepoints::hypervisor_helpers::set_current_context(entry.vm_id, 0, 0);
-        let _ = crate::runtime::run_program(entry.prog_id, Some(ctx.as_bytes_mut()));
-        crate::tracepoints::hypervisor_helpers::clear_current_context();
+    run_uprobe_program(&entry, current_vcpu_id(), regs);
+
+    begin_single_step_for_entry(vm_id, pc, entry.hva, entry.saved_insn)
+}
+
+fn handle_guest_uretprobe_entry_hit(
+    vm_id: u32,
+    pc: u64,
+    regs: &[u64; 31],
+    entry: super::manager::ActiveUprobeEntry,
+) -> UprobeBrkHandleResult {
+    let return_gva = regs[30];
+    if return_gva == 0 {
+        log::warn!(
+            "guest_uretprobe: skip arm on null LR vm{} path={} symbol={} entry_pc={:#x}",
+            entry.vm_id,
+            entry.guest_path,
+            entry.symbol,
+            pc
+        );
+        return begin_single_step_for_entry(vm_id, pc, entry.hva, entry.saved_insn);
     }
 
-    let cpu_id = crate::platform::cpu_id() as usize;
-    {
-        let mut pending = SINGLE_STEP_STATE.lock();
-        if pending.contains_key(&cpu_id) {
+    match super::manager::acquire_return_brk(entry.vm_id, entry.mm, return_gva) {
+        Ok((return_hva, saved_insn, _refcount)) => {
+            let push_result = super::return_stack::push(super::return_stack::ReturnEntry {
+                vm_id: entry.vm_id,
+                vcpu_id: current_vcpu_id(),
+                mm: entry.mm,
+                entry_pc: entry.pc,
+                return_gva,
+                return_hva,
+                saved_insn,
+                prog_id: entry.prog_id,
+                guest_path: entry.guest_path.clone(),
+                symbol: entry.symbol.clone(),
+                pid: entry.pid,
+                tgid: entry.tgid,
+                comm: entry.comm.clone(),
+            });
+            if let Err(err) = push_result {
+                match super::manager::release_return_brk(entry.vm_id, entry.mm, return_gva) {
+                    Ok(false) => {
+                        let _ = super::manager::restore_instruction_for_step(return_hva, saved_insn);
+                    }
+                    Ok(true) => {}
+                    Err(release_err) => {
+                        log::warn!(
+                            "guest_uretprobe: rollback failed vm{} entry_pc={:#x} return_pc={:#x}: {}",
+                            entry.vm_id,
+                            pc,
+                            return_gva,
+                            release_err
+                        );
+                    }
+                }
+                log::warn!(
+                    "guest_uretprobe: failed to push return instance vm{} entry_pc={:#x} return_pc={:#x}: {}",
+                    entry.vm_id,
+                    pc,
+                    return_gva,
+                    err
+                );
+            } else {
+                log::info!(
+                    "guest_uretprobe_arm: vm{} path={} symbol={} entry_pc={:#x} return_pc={:#x} mm={:#x} pid={} tgid={} prog_id={}",
+                    entry.vm_id,
+                    entry.guest_path,
+                    entry.symbol,
+                    pc,
+                    return_gva,
+                    entry.mm,
+                    entry.pid,
+                    entry.tgid,
+                    entry.prog_id
+                );
+            }
+        }
+        Err(err) => {
+            log::warn!(
+                "guest_uretprobe: failed to arm return BRK vm{} path={} symbol={} entry_pc={:#x} return_pc={:#x}: {}",
+                entry.vm_id,
+                entry.guest_path,
+                entry.symbol,
+                pc,
+                return_gva,
+                err
+            );
+        }
+    }
+
+    begin_single_step_for_entry(vm_id, pc, entry.hva, entry.saved_insn)
+}
+
+fn handle_guest_uretprobe_return_hit(
+    vm_id: u32,
+    pc: u64,
+    regs: &[u64; 31],
+    entry: super::return_stack::ReturnEntry,
+) -> UprobeBrkHandleResult {
+    let should_reinject = match super::manager::release_return_brk(entry.vm_id, entry.mm, entry.return_gva) {
+        Ok(should_reinject) => should_reinject,
+        Err(err) => {
+            log::warn!(
+                "guest_uretprobe: failed to release return BRK vm{} entry_pc={:#x} return_pc={:#x}: {}",
+                entry.vm_id,
+                entry.entry_pc,
+                pc,
+                err
+            );
             return UprobeBrkHandleResult::ProbeHitFallbackSkip;
         }
-        pending.insert(
-            cpu_id,
-            UprobeSingleStepState::ReinjectBrk {
-                vm_id,
-                pc,
-                hva: entry.hva,
-            },
-        );
-    }
+    };
 
-    if let Err(err) = super::manager::restore_instruction_for_step(entry.hva, entry.saved_insn) {
-        let _ = SINGLE_STEP_STATE.lock().remove(&cpu_id);
-        let _ = super::manager::remove_active(vm_id, pc);
+    let Some(active) = super::manager::increment_active_hits(entry.vm_id, entry.entry_pc) else {
         log::warn!(
-            "guest_uprobe: failed to restore instruction vm{} pc={:#x}: {}",
-            vm_id,
-            pc,
-            err
+            "guest_uretprobe: active probe missing for return hit vm{} entry_pc={:#x} return_pc={:#x}",
+            entry.vm_id,
+            entry.entry_pc,
+            pc
         );
-        return UprobeBrkHandleResult::ProbeHitFallbackSkip;
+        return begin_single_step_for_return(vm_id, pc, entry.return_hva, entry.saved_insn, should_reinject);
+    };
+
+    log::info!(
+        "guest_uretprobe_hit: vm{} path={} symbol={} entry_pc={:#x} return_pc={:#x} mm={:#x} pid={} tgid={} hits={} prog_id={}",
+        entry.vm_id,
+        active.guest_path,
+        active.symbol,
+        entry.entry_pc,
+        pc,
+        entry.mm,
+        active.pid,
+        active.tgid,
+        active.hits,
+        active.prog_id
+    );
+
+    #[cfg(all(feature = "runtime", feature = "tracepoint-support"))]
+    emit_uprobe_event(&active, entry.entry_pc);
+
+    #[cfg(feature = "runtime")]
+    run_uprobe_program(&active, entry.vcpu_id, regs);
+
+    begin_single_step_for_return(vm_id, pc, entry.return_hva, entry.saved_insn, should_reinject)
+}
+
+pub fn handle_guest_brk(
+    vm_id: u32,
+    pc: u64,
+    _iss: u64,
+    regs: &[u64; 31],
+    spsr: u64,
+) -> UprobeBrkHandleResult {
+    if !is_guest_user_mode(spsr) {
+        return UprobeBrkHandleResult::Unhandled;
     }
 
-    UprobeBrkHandleResult::ProbeHitSingleStep
+    if let Some(active) = super::manager::lookup_active(vm_id, pc) {
+        if active.is_ret {
+            return handle_guest_uretprobe_entry_hit(vm_id, pc, regs, active);
+        }
+        return handle_guest_uprobe_hit(vm_id, pc, regs);
+    }
+
+    if let Some(mm) = current_mm(vm_id)
+        && let Some(entry) = super::return_stack::pop(vm_id, current_vcpu_id(), mm, pc)
+    {
+        return handle_guest_uretprobe_return_hit(vm_id, pc, regs, entry);
+    }
+    if let Some(entry) = super::return_stack::pop_for_vcpu(vm_id, current_vcpu_id(), pc) {
+        return handle_guest_uretprobe_return_hit(vm_id, pc, regs, entry);
+    }
+
+    UprobeBrkHandleResult::Unhandled
 }
 
 pub fn handle_software_step() -> bool {
@@ -191,11 +423,26 @@ pub fn handle_software_step() -> bool {
     };
 
     match state {
-        UprobeSingleStepState::ReinjectBrk { vm_id, pc, hva } => {
+        UprobeSingleStepState::ReinjectEntryBrk { vm_id, pc, hva } => {
             if let Err(err) = super::manager::reinject_breakpoint(hva) {
                 let _ = super::manager::remove_active(vm_id, pc);
                 log::warn!(
                     "guest_uprobe: failed to reinject BRK vm{} pc={:#x}: {}",
+                    vm_id,
+                    pc,
+                    err
+                );
+            }
+        }
+        UprobeSingleStepState::ReinjectReturnBrk {
+            vm_id,
+            pc,
+            hva,
+            should_reinject,
+        } => {
+            if should_reinject && let Err(err) = super::manager::reinject_breakpoint(hva) {
+                log::warn!(
+                    "guest_uretprobe: failed to reinject return BRK vm{} pc={:#x}: {}",
                     vm_id,
                     pc,
                     err
@@ -234,7 +481,8 @@ fn is_stepping_exec_barrier(vm_id: u32, fault_gpa: u64) -> bool {
             *state_vm_id == vm_id
                 && (*barrier_gpa..barrier_gpa.saturating_add(*barrier_size)).contains(&fault_gpa)
         }
-        UprobeSingleStepState::ReinjectBrk { .. } => false,
+        UprobeSingleStepState::ReinjectEntryBrk { .. }
+        | UprobeSingleStepState::ReinjectReturnBrk { .. } => false,
     })
 }
 

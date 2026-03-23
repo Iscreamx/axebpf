@@ -9,6 +9,7 @@ use spin::{Mutex, RwLock};
 
 use super::object;
 use super::process_maps::ProcessMaps;
+use super::return_stack;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UprobeState {
@@ -78,6 +79,7 @@ struct UprobeRegistry {
     pending: BTreeMap<PendingKey, PendingUprobeEntry>,
     active: BTreeMap<(u32, u64), ActiveUprobeEntry>,
     armed_exec_barriers: BTreeMap<(u32, u64), ArmedExecBarrier>,
+    return_brks: BTreeMap<ReturnBrkKey, ReturnBrkState>,
 }
 
 #[derive(Clone, Copy)]
@@ -91,6 +93,20 @@ struct PatchResult {
 struct ArmedExecBarrier {
     size: u64,
     target_gpa: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ReturnBrkKey {
+    vm_id: u32,
+    mm: u64,
+    return_gva: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReturnBrkState {
+    return_hva: usize,
+    saved_insn: u32,
+    refcount: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +124,7 @@ static UPROBES: Mutex<UprobeRegistry> = Mutex::new(UprobeRegistry {
     pending: BTreeMap::new(),
     active: BTreeMap::new(),
     armed_exec_barriers: BTreeMap::new(),
+    return_brks: BTreeMap::new(),
 });
 static PATCH_BACKEND: RwLock<Option<PatchBackendFn>> = RwLock::new(None);
 static RESTORE_BACKEND: RwLock<Option<RestoreBackendFn>> = RwLock::new(None);
@@ -299,6 +316,7 @@ pub fn detach(vm_id: u32, guest_path: &str, symbol_or_offset: &str) -> Result<()
     let offset = resolve_offset(vm_id, guest_path, symbol_or_offset)?;
     let mut probes = UPROBES.lock();
     let mut removed_any = false;
+    let mut cleared_return_entries = Vec::new();
 
     let pending_keys: Vec<_> = probes
         .pending
@@ -322,11 +340,17 @@ pub fn detach(vm_id: u32, guest_path: &str, symbol_or_offset: &str) -> Result<()
     for key in &active_keys {
         if let Some(entry) = probes.active.get(key) {
             restore_instruction(entry.hva, entry.saved_insn)?;
+            if entry.is_ret {
+                cleared_return_entries.extend(return_stack::clear_for_entry(entry.vm_id, entry.pc));
+            }
         }
     }
     for key in active_keys {
         removed_any |= probes.active.remove(&key).is_some();
     }
+    drop(probes);
+
+    cleanup_cleared_return_entries(cleared_return_entries);
 
     if removed_any {
         return Ok(());
@@ -387,7 +411,7 @@ pub fn lookup_active(vm_id: u32, pc: u64) -> Option<ActiveUprobeEntry> {
     UPROBES.lock().active.get(&(vm_id, pc)).cloned()
 }
 
-pub fn record_active_hit(vm_id: u32, pc: u64) -> Option<ActiveUprobeEntry> {
+pub fn increment_active_hits(vm_id: u32, pc: u64) -> Option<ActiveUprobeEntry> {
     let mut probes = UPROBES.lock();
     let entry = probes.active.get_mut(&(vm_id, pc))?;
     entry.hits = entry.hits.saturating_add(1);
@@ -404,7 +428,98 @@ pub fn disable_active(vm_id: u32, pc: u64) -> Result<(), &'static str> {
         return Err("active uprobe not found");
     };
     restore_instruction(entry.hva, entry.saved_insn)?;
+    let cleared_return_entries = if entry.is_ret {
+        return_stack::clear_for_entry(entry.vm_id, entry.pc)
+    } else {
+        Vec::new()
+    };
+    drop(probes);
+    cleanup_cleared_return_entries(cleared_return_entries);
     Ok(())
+}
+
+fn cleanup_cleared_return_entries(entries: Vec<return_stack::ReturnEntry>) {
+    let mut cleaned = Vec::<(u32, u64, u64)>::new();
+    for entry in entries {
+        let key = (entry.vm_id, entry.mm, entry.return_gva);
+        if cleaned.contains(&key) {
+            continue;
+        }
+        cleaned.push(key);
+        if let Err(err) = cleanup_return_brk(entry.vm_id, entry.mm, entry.return_gva) {
+            log::warn!(
+                "guest_uretprobe: cleanup return BRK vm{} mm={:#x} pc={:#x} failed: {}",
+                entry.vm_id,
+                entry.mm,
+                entry.return_gva,
+                err
+            );
+        }
+    }
+}
+
+pub fn acquire_return_brk(
+    vm_id: u32,
+    mm: u64,
+    return_gva: u64,
+) -> Result<(usize, u32, u32), &'static str> {
+    let key = ReturnBrkKey {
+        vm_id,
+        mm,
+        return_gva,
+    };
+    let mut probes = UPROBES.lock();
+    if let Some(state) = probes.return_brks.get_mut(&key) {
+        state.refcount = state.refcount.saturating_add(1);
+        return Ok((state.return_hva, state.saved_insn, state.refcount));
+    }
+    drop(probes);
+
+    let patch = patch_runtime_pc(vm_id, return_gva)?;
+
+    let mut probes = UPROBES.lock();
+    if let Some(state) = probes.return_brks.get_mut(&key) {
+        state.refcount = state.refcount.saturating_add(1);
+        return Ok((state.return_hva, state.saved_insn, state.refcount));
+    }
+    probes.return_brks.insert(
+        key,
+        ReturnBrkState {
+            return_hva: patch.hva,
+            saved_insn: patch.saved_insn,
+            refcount: 1,
+        },
+    );
+    Ok((patch.hva, patch.saved_insn, 1))
+}
+
+pub fn release_return_brk(vm_id: u32, mm: u64, return_gva: u64) -> Result<bool, &'static str> {
+    let key = ReturnBrkKey {
+        vm_id,
+        mm,
+        return_gva,
+    };
+    let mut probes = UPROBES.lock();
+    let state = probes.return_brks.get_mut(&key).ok_or("return BRK not found")?;
+    if state.refcount <= 1 {
+        probes.return_brks.remove(&key);
+        return Ok(false);
+    }
+    state.refcount -= 1;
+    Ok(true)
+}
+
+pub fn cleanup_return_brk(vm_id: u32, mm: u64, return_gva: u64) -> Result<(), &'static str> {
+    let key = ReturnBrkKey {
+        vm_id,
+        mm,
+        return_gva,
+    };
+    let state = UPROBES.lock().return_brks.remove(&key);
+    let Some(state) = state else {
+        return Ok(());
+    };
+    restore_instruction(state.return_hva, state.saved_insn)
 }
 
 fn activate_for_mapping(
@@ -607,10 +722,10 @@ pub(crate) fn handle_exec_barrier_fault(
             barrier.target_gpa,
             fault_gpa
         );
-        return Ok(ExecBarrierFaultAction::ProbeHitSingleStep {
+        Ok(ExecBarrierFaultAction::ProbeHitSingleStep {
             barrier_gpa,
             barrier_size: barrier.size,
-        });
+        })
     }
 
     #[cfg(not(feature = "guest-kprobe"))]
@@ -729,6 +844,40 @@ pub fn lookup_active_for_test(vm_id: u32, pc: u64) -> Option<ActiveUprobeEntry> 
 }
 
 #[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReturnBrkStateForTest {
+    pub return_hva: usize,
+    pub saved_insn: u32,
+    pub refcount: u32,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn lookup_return_brk_for_test(
+    vm_id: u32,
+    mm: u64,
+    return_gva: u64,
+) -> Option<ReturnBrkStateForTest> {
+    UPROBES
+        .lock()
+        .return_brks
+        .get(&ReturnBrkKey {
+            vm_id,
+            mm,
+            return_gva,
+        })
+        .map(|state| ReturnBrkStateForTest {
+            return_hva: state.return_hva,
+            saved_insn: state.saved_insn,
+            refcount: state.refcount,
+        })
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn clear_return_brks_for_test() {
+    UPROBES.lock().return_brks.clear();
+}
+
+#[cfg(any(test, feature = "test-utils"))]
 pub fn set_mock_patch_result_for_test(hva: usize, saved_insn: u32, gpa: u64) {
     *MOCK_PATCH_RESULT.lock() = PatchResult {
         hva,
@@ -756,6 +905,7 @@ pub fn install_mock_active_probe_for_test(
     hva: usize,
     saved_insn: u32,
     prog_id: u32,
+    is_ret: bool,
 ) {
     *RESTORE_BACKEND.write() = Some(mock_restore_instruction);
     *REINJECT_BACKEND.write() = Some(mock_reinject_breakpoint);
@@ -769,7 +919,7 @@ pub fn install_mock_active_probe_for_test(
             offset: 0,
             hits: 0,
             prog_id,
-            is_ret: false,
+            is_ret,
             mm: 0,
             pid: 0,
             tgid: 0,
@@ -787,6 +937,7 @@ pub fn clear_all_for_test() {
     probes.pending.clear();
     probes.active.clear();
     probes.armed_exec_barriers.clear();
+    probes.return_brks.clear();
     *PATCH_BACKEND.write() = None;
     *RESTORE_BACKEND.write() = None;
     *REINJECT_BACKEND.write() = None;
