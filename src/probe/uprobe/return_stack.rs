@@ -100,6 +100,37 @@ pub fn clear_for_entry(vm_id: u32, entry_pc: u64) -> Vec<ReturnEntry> {
     removed
 }
 
+pub fn clear_for_entry_instance(vm_id: u32, mm: u64, entry_pc: u64) -> Vec<ReturnEntry> {
+    let mut stacks = RETURN_STACKS.lock();
+    let keys: Vec<_> = stacks
+        .keys()
+        .filter(|&&(entry_vm_id, _, entry_mm)| entry_vm_id == vm_id && entry_mm == mm)
+        .copied()
+        .collect();
+    let mut removed = Vec::new();
+
+    for key in keys {
+        let Some(entries) = stacks.get_mut(&key) else {
+            continue;
+        };
+        let mut retained = Vec::with_capacity(entries.len());
+        for entry in entries.drain(..) {
+            if entry.vm_id == vm_id && entry.mm == mm && entry.entry_pc == entry_pc {
+                removed.push(entry);
+            } else {
+                retained.push(entry);
+            }
+        }
+        if retained.is_empty() {
+            stacks.remove(&key);
+        } else {
+            *entries = retained;
+        }
+    }
+
+    removed
+}
+
 pub fn clear_for_vm(vm_id: u32) -> Vec<ReturnEntry> {
     let mut stacks = RETURN_STACKS.lock();
     let keys: Vec<_> = stacks.keys().copied().collect();
@@ -112,6 +143,51 @@ pub fn clear_for_vm(vm_id: u32) -> Vec<ReturnEntry> {
         let mut retained = Vec::with_capacity(entries.len());
         for entry in entries.drain(..) {
             if entry.vm_id == vm_id {
+                removed.push(entry);
+            } else {
+                retained.push(entry);
+            }
+        }
+        if retained.is_empty() {
+            stacks.remove(&key);
+        } else {
+            *entries = retained;
+        }
+    }
+
+    removed
+}
+
+pub fn clear_for_mm(vm_id: u32, mm: u64) -> Vec<ReturnEntry> {
+    let mut stacks = RETURN_STACKS.lock();
+    let keys: Vec<_> = stacks
+        .keys()
+        .filter(|&&(entry_vm_id, _, entry_mm)| entry_vm_id == vm_id && entry_mm == mm)
+        .copied()
+        .collect();
+    let mut removed = Vec::new();
+
+    for key in keys {
+        if let Some(entries) = stacks.remove(&key) {
+            removed.extend(entries);
+        }
+    }
+
+    removed
+}
+
+pub fn clear_for_pid(vm_id: u32, pid: u32) -> Vec<ReturnEntry> {
+    let mut stacks = RETURN_STACKS.lock();
+    let keys: Vec<_> = stacks.keys().copied().collect();
+    let mut removed = Vec::new();
+
+    for key in keys {
+        let Some(entries) = stacks.get_mut(&key) else {
+            continue;
+        };
+        let mut retained = Vec::with_capacity(entries.len());
+        for entry in entries.drain(..) {
+            if entry.vm_id == vm_id && entry.pid == pid {
                 removed.push(entry);
             } else {
                 retained.push(entry);

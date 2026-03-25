@@ -32,6 +32,10 @@ pub struct UprobeListEntry {
     pub guest_path: String,
     pub symbol: String,
     pub offset: u64,
+    pub mm: u64,
+    pub pid: u32,
+    pub tgid: u32,
+    pub comm: String,
     pub hits: u64,
     pub prog_id: u32,
     pub is_ret: bool,
@@ -77,7 +81,7 @@ struct PendingKey {
 #[derive(Default)]
 struct UprobeRegistry {
     pending: BTreeMap<PendingKey, PendingUprobeEntry>,
-    active: BTreeMap<(u32, u64), ActiveUprobeEntry>,
+    active: BTreeMap<(u32, u64, u64), ActiveUprobeEntry>,
     armed_exec_barriers: BTreeMap<(u32, u64), ArmedExecBarrier>,
     return_brks: BTreeMap<ReturnBrkKey, ReturnBrkState>,
 }
@@ -287,13 +291,14 @@ pub fn attach_symbol(
     };
 
     let mut probes = UPROBES.lock();
-    if probes.pending.contains_key(&key)
-        || probes.active.values().any(|entry| {
-            entry.vm_id == vm_id
-                && entry.guest_path == guest_path
-                && entry.offset == offset
-                && entry.is_ret == is_ret
-        })
+    if probes
+        .pending
+        .values()
+        .any(|entry| entry.vm_id == vm_id && entry.guest_path == guest_path && entry.offset == offset)
+        || probes
+            .active
+            .values()
+            .any(|entry| entry.vm_id == vm_id && entry.guest_path == guest_path && entry.offset == offset)
     {
         return Err("duplicate uprobe registration");
     }
@@ -341,7 +346,11 @@ pub fn detach(vm_id: u32, guest_path: &str, symbol_or_offset: &str) -> Result<()
         if let Some(entry) = probes.active.get(key) {
             restore_instruction(entry.hva, entry.saved_insn)?;
             if entry.is_ret {
-                cleared_return_entries.extend(return_stack::clear_for_entry(entry.vm_id, entry.pc));
+                cleared_return_entries.extend(return_stack::clear_for_entry_instance(
+                    entry.vm_id,
+                    entry.mm,
+                    entry.pc,
+                ));
             }
         }
     }
@@ -350,7 +359,7 @@ pub fn detach(vm_id: u32, guest_path: &str, symbol_or_offset: &str) -> Result<()
     }
     drop(probes);
 
-    cleanup_cleared_return_entries(cleared_return_entries);
+    release_cleared_return_entries(cleared_return_entries);
 
     if removed_any {
         return Ok(());
@@ -369,6 +378,10 @@ pub fn list_all() -> Vec<UprobeListEntry> {
             guest_path: entry.guest_path.clone(),
             symbol: entry.symbol.clone(),
             offset: entry.offset,
+            mm: 0,
+            pid: 0,
+            tgid: 0,
+            comm: String::new(),
             hits: 0,
             prog_id: entry.prog_id,
             is_ret: entry.is_ret,
@@ -381,6 +394,10 @@ pub fn list_all() -> Vec<UprobeListEntry> {
         guest_path: entry.guest_path.clone(),
         symbol: entry.symbol.clone(),
         offset: entry.offset,
+        mm: entry.mm,
+        pid: entry.pid,
+        tgid: entry.tgid,
+        comm: entry.comm.clone(),
         hits: entry.hits,
         prog_id: entry.prog_id,
         is_ret: entry.is_ret,
@@ -388,10 +405,19 @@ pub fn list_all() -> Vec<UprobeListEntry> {
     }));
 
     entries.sort_by(|lhs, rhs| {
-        (lhs.vm_id, lhs.guest_path.as_str(), lhs.offset, lhs.is_ret, lhs.state.label()).cmp(&(
+        (
+            lhs.vm_id,
+            lhs.guest_path.as_str(),
+            lhs.offset,
+            lhs.mm,
+            lhs.is_ret,
+            lhs.state.label(),
+        )
+            .cmp(&(
             rhs.vm_id,
             rhs.guest_path.as_str(),
             rhs.offset,
+            rhs.mm,
             rhs.is_ret,
             rhs.state.label(),
         ))
@@ -408,54 +434,177 @@ pub fn has_pending_path(vm_id: u32, guest_path: &str) -> bool {
 }
 
 pub fn lookup_active(vm_id: u32, pc: u64) -> Option<ActiveUprobeEntry> {
-    UPROBES.lock().active.get(&(vm_id, pc)).cloned()
+    UPROBES
+        .lock()
+        .active
+        .values()
+        .find(|entry| entry.vm_id == vm_id && entry.pc == pc)
+        .cloned()
+}
+
+pub fn lookup_active_for_mm(vm_id: u32, mm: u64, pc: u64) -> Option<ActiveUprobeEntry> {
+    UPROBES.lock().active.get(&(vm_id, mm, pc)).cloned()
 }
 
 pub fn increment_active_hits(vm_id: u32, pc: u64) -> Option<ActiveUprobeEntry> {
     let mut probes = UPROBES.lock();
-    let entry = probes.active.get_mut(&(vm_id, pc))?;
+    let key = probes
+        .active
+        .iter()
+        .find_map(|(key, entry)| (entry.vm_id == vm_id && entry.pc == pc).then_some(*key))?;
+    let entry = probes.active.get_mut(&key)?;
+    entry.hits = entry.hits.saturating_add(1);
+    Some(entry.clone())
+}
+
+pub fn increment_active_hits_for_mm(vm_id: u32, mm: u64, pc: u64) -> Option<ActiveUprobeEntry> {
+    let mut probes = UPROBES.lock();
+    let entry = probes.active.get_mut(&(vm_id, mm, pc))?;
     entry.hits = entry.hits.saturating_add(1);
     Some(entry.clone())
 }
 
 pub fn remove_active(vm_id: u32, pc: u64) -> Option<ActiveUprobeEntry> {
-    UPROBES.lock().active.remove(&(vm_id, pc))
+    let mut probes = UPROBES.lock();
+    let key = probes
+        .active
+        .iter()
+        .find_map(|(key, entry)| (entry.vm_id == vm_id && entry.pc == pc).then_some(*key))?;
+    probes.active.remove(&key)
+}
+
+pub fn remove_active_for_mm(vm_id: u32, mm: u64, pc: u64) -> Option<ActiveUprobeEntry> {
+    UPROBES.lock().active.remove(&(vm_id, mm, pc))
 }
 
 pub fn disable_active(vm_id: u32, pc: u64) -> Result<(), &'static str> {
     let mut probes = UPROBES.lock();
-    let Some(entry) = probes.active.remove(&(vm_id, pc)) else {
+    let Some(key) = probes
+        .active
+        .iter()
+        .find_map(|(key, entry)| (entry.vm_id == vm_id && entry.pc == pc).then_some(*key))
+    else {
+        return Err("active uprobe not found");
+    };
+    let Some(entry) = probes.active.remove(&key) else {
         return Err("active uprobe not found");
     };
     restore_instruction(entry.hva, entry.saved_insn)?;
     let cleared_return_entries = if entry.is_ret {
-        return_stack::clear_for_entry(entry.vm_id, entry.pc)
+        return_stack::clear_for_entry_instance(entry.vm_id, entry.mm, entry.pc)
     } else {
         Vec::new()
     };
     drop(probes);
-    cleanup_cleared_return_entries(cleared_return_entries);
+    release_cleared_return_entries(cleared_return_entries);
     Ok(())
 }
 
-fn cleanup_cleared_return_entries(entries: Vec<return_stack::ReturnEntry>) {
-    let mut cleaned = Vec::<(u32, u64, u64)>::new();
+fn release_cleared_return_entries(entries: Vec<return_stack::ReturnEntry>) {
     for entry in entries {
-        let key = (entry.vm_id, entry.mm, entry.return_gva);
-        if cleaned.contains(&key) {
-            continue;
+        match release_return_brk(entry.vm_id, entry.mm, entry.return_gva) {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Err(err) = restore_instruction(entry.return_hva, entry.saved_insn) {
+                    log::warn!(
+                        "guest_uretprobe: cleanup return BRK vm{} mm={:#x} pc={:#x} failed: {}",
+                        entry.vm_id,
+                        entry.mm,
+                        entry.return_gva,
+                        err
+                    );
+                }
+            }
+            Err(err) => {
+                log::warn!(
+                    "guest_uretprobe: release return BRK vm{} mm={:#x} pc={:#x} failed: {}",
+                    entry.vm_id,
+                    entry.mm,
+                    entry.return_gva,
+                    err
+                );
+            }
         }
-        cleaned.push(key);
-        if let Err(err) = cleanup_return_brk(entry.vm_id, entry.mm, entry.return_gva) {
+    }
+}
+
+fn cleanup_remaining_return_brks_for_mm(vm_id: u32, mm: u64) {
+    let keys: Vec<_> = {
+        let probes = UPROBES.lock();
+        probes
+            .return_brks
+            .keys()
+            .filter(|key| key.vm_id == vm_id && key.mm == mm)
+            .copied()
+            .collect()
+    };
+
+    for key in keys {
+        if let Err(err) = cleanup_return_brk(key.vm_id, key.mm, key.return_gva) {
             log::warn!(
                 "guest_uretprobe: cleanup return BRK vm{} mm={:#x} pc={:#x} failed: {}",
-                entry.vm_id,
-                entry.mm,
-                entry.return_gva,
+                key.vm_id,
+                key.mm,
+                key.return_gva,
                 err
             );
         }
     }
+}
+
+pub fn cleanup_mm(vm_id: u32, mm: u64) -> Result<(), &'static str> {
+    let mut probes = UPROBES.lock();
+    let active_keys: Vec<_> = probes
+        .active
+        .iter()
+        .filter_map(|(key, entry)| (entry.vm_id == vm_id && entry.mm == mm).then_some(*key))
+        .collect();
+
+    for key in &active_keys {
+        if let Some(entry) = probes.active.get(key) {
+            restore_instruction(entry.hva, entry.saved_insn)?;
+            log::info!(
+                "guest_uprobe_deactivate_mm: vm{} mm={:#x} path={} symbol={} pc={:#x}",
+                entry.vm_id,
+                entry.mm,
+                entry.guest_path,
+                entry.symbol,
+                entry.pc
+            );
+        }
+    }
+
+    for key in active_keys {
+        probes.active.remove(&key);
+    }
+    drop(probes);
+
+    release_cleared_return_entries(return_stack::clear_for_mm(vm_id, mm));
+    cleanup_remaining_return_brks_for_mm(vm_id, mm);
+    Ok(())
+}
+
+pub fn cleanup_pid(vm_id: u32, pid: u32) -> Result<(), &'static str> {
+    let mut probes = UPROBES.lock();
+    let active_keys: Vec<_> = probes
+        .active
+        .iter()
+        .filter_map(|(key, entry)| (entry.vm_id == vm_id && entry.pid == pid).then_some(*key))
+        .collect();
+
+    for key in &active_keys {
+        if let Some(entry) = probes.active.get(key) {
+            restore_instruction(entry.hva, entry.saved_insn)?;
+        }
+    }
+
+    for key in active_keys {
+        probes.active.remove(&key);
+    }
+    drop(probes);
+
+    release_cleared_return_entries(return_stack::clear_for_pid(vm_id, pid));
+    Ok(())
 }
 
 pub fn acquire_return_brk(
@@ -558,7 +707,7 @@ fn activate_for_mapping(
 
         {
             let probes = UPROBES.lock();
-            if probes.active.contains_key(&(vm_id, runtime_pc)) {
+            if probes.active.contains_key(&(vm_id, mm, runtime_pc)) {
                 continue;
             }
         }
@@ -579,11 +728,12 @@ fn activate_for_mapping(
 
         {
             let mut probes = UPROBES.lock();
-            if probes.pending.remove(&key).is_none() || probes.active.contains_key(&(vm_id, runtime_pc)) {
+            if !probes.pending.contains_key(&key) || probes.active.contains_key(&(vm_id, mm, runtime_pc))
+            {
                 continue;
             }
             probes.active.insert(
-                (vm_id, runtime_pc),
+                (vm_id, mm, runtime_pc),
                 ActiveUprobeEntry {
                     vm_id,
                     guest_path: pending.guest_path,
@@ -844,6 +994,11 @@ pub fn lookup_active_for_test(vm_id: u32, pc: u64) -> Option<ActiveUprobeEntry> 
 }
 
 #[cfg(any(test, feature = "test-utils"))]
+pub fn lookup_active_for_mm_for_test(vm_id: u32, mm: u64, pc: u64) -> Option<ActiveUprobeEntry> {
+    UPROBES.lock().active.get(&(vm_id, mm, pc)).cloned()
+}
+
+#[cfg(any(test, feature = "test-utils"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReturnBrkStateForTest {
     pub return_hva: usize,
@@ -911,7 +1066,7 @@ pub fn install_mock_active_probe_for_test(
     *REINJECT_BACKEND.write() = Some(mock_reinject_breakpoint);
     let mut probes = UPROBES.lock();
     probes.active.insert(
-        (vm_id, pc),
+        (vm_id, 0x1000, pc),
         ActiveUprobeEntry {
             vm_id,
             guest_path: "/mock".to_string(),
@@ -920,7 +1075,7 @@ pub fn install_mock_active_probe_for_test(
             hits: 0,
             prog_id,
             is_ret,
-            mm: 0,
+            mm: 0x1000,
             pid: 0,
             tgid: 0,
             comm: String::new(),

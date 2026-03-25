@@ -2,6 +2,10 @@
 
 use std::sync::{Mutex, MutexGuard};
 
+use axebpf::probe::guest_runtime_state::{
+    LiveGuestRuntimeState, LiveGuestRuntimeStateGuard, clear_live_guest_runtime_state_for_test,
+    install_live_guest_runtime_state,
+};
 use axebpf::probe::uprobe::handler::{
     build_uprobe_ctx_for_test, is_guest_user_mode, should_emit_for_filter,
 };
@@ -18,6 +22,18 @@ fn lock_test_state() -> MutexGuard<'static, ()> {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
+}
+
+fn install_current_mm(vm_id: u32, mm: u64) -> LiveGuestRuntimeStateGuard {
+    install_live_guest_runtime_state(LiveGuestRuntimeState {
+        vm_id,
+        ttbr0_el1: mm,
+        ttbr1_el1: 0,
+        contextidr_el1: 0,
+        sp_el0: 0,
+        tpidr_el0: 0,
+        guest_spsr: 0,
+    })
 }
 
 #[test]
@@ -93,7 +109,9 @@ fn el0_brk_hit_restores_insn_and_requests_single_step() {
     manager::init();
     manager::clear_all_for_test();
     handler::clear_state_for_test();
+    clear_live_guest_runtime_state_for_test();
     manager::install_mock_active_probe_for_test(3, 0x400010, 0x8000, 0x12345678, 7, false);
+    let _live_state = install_current_mm(3, 0x1000);
 
     let regs = [0u64; 31];
     let result = handler::handle_guest_brk_for_test(3, 0x400010, 0, &regs, 0b0000);
@@ -107,6 +125,7 @@ fn ret_entry_hit_only_arms_return_site() {
     manager::init();
     manager::clear_all_for_test();
     handler::clear_state_for_test();
+    clear_live_guest_runtime_state_for_test();
     return_stack::clear_all_for_test();
     object::load_text_symbols(5, "/usr/bin/demo", "0000000000000010 T target_fn\n").unwrap();
     manager::attach_symbol(5, "/usr/bin/demo", "target_fn", 9, true).unwrap();
@@ -114,6 +133,7 @@ fn ret_entry_hit_only_arms_return_site() {
     manager::activate_for_mapping_for_test(5, "/usr/bin/demo", 0x1000, 0x400000, 0, 0x8000, 0x12345678)
         .unwrap();
     manager::set_mock_patch_result_for_test(0x9000, 0xd65f03c0, 0);
+    let _live_state = install_current_mm(5, 0x1000);
 
     let mut regs = [0u64; 31];
     regs[30] = 0x5000;
@@ -132,6 +152,7 @@ fn ret_probe_hit_increments_hits_only_on_return() {
     manager::init();
     manager::clear_all_for_test();
     handler::clear_state_for_test();
+    clear_live_guest_runtime_state_for_test();
     return_stack::clear_all_for_test();
     object::load_text_symbols(6, "/usr/bin/demo", "0000000000000010 T target_fn\n").unwrap();
     manager::attach_symbol(6, "/usr/bin/demo", "target_fn", 10, true).unwrap();
@@ -139,6 +160,7 @@ fn ret_probe_hit_increments_hits_only_on_return() {
     manager::activate_for_mapping_for_test(6, "/usr/bin/demo", 0x2000, 0x400000, 0, 0x8000, 0x12345678)
         .unwrap();
     manager::set_mock_patch_result_for_test(0x9000, 0xd65f03c0, 0);
+    let _live_state = install_current_mm(6, 0x2000);
 
     let mut regs = [0u64; 31];
     regs[30] = 0x5000;
@@ -161,6 +183,7 @@ fn ret_probe_overlapping_calls_share_return_brk_refcount() {
     manager::init();
     manager::clear_all_for_test();
     handler::clear_state_for_test();
+    clear_live_guest_runtime_state_for_test();
     return_stack::clear_all_for_test();
     object::load_text_symbols(7, "/usr/bin/demo", "0000000000000010 T target_fn\n").unwrap();
     manager::attach_symbol(7, "/usr/bin/demo", "target_fn", 11, true).unwrap();
@@ -168,6 +191,7 @@ fn ret_probe_overlapping_calls_share_return_brk_refcount() {
     manager::activate_for_mapping_for_test(7, "/usr/bin/demo", 0x3000, 0x400000, 0, 0x8000, 0x12345678)
         .unwrap();
     manager::set_mock_patch_result_for_test(0x9000, 0xd65f03c0, 0);
+    let _live_state = install_current_mm(7, 0x3000);
 
     let mut regs = [0u64; 31];
     regs[30] = 0x5000;
@@ -217,10 +241,95 @@ fn non_el0_brk_is_left_unhandled() {
     manager::init();
     manager::clear_all_for_test();
     handler::clear_state_for_test();
+    clear_live_guest_runtime_state_for_test();
     manager::install_mock_active_probe_for_test(4, 0x400010, 0x8000, 0x12345678, 7, false);
 
     let regs = [0u64; 31];
     let result = handler::handle_guest_brk_for_test(4, 0x400010, 0, &regs, 0b0101);
 
     assert!(matches!(result, handler::UprobeBrkHandleResult::Unhandled));
+}
+
+#[test]
+fn non_ret_uprobe_hit_uses_current_mm_instance() {
+    let _guard = lock_test_state();
+    manager::init();
+    manager::clear_all_for_test();
+    handler::clear_state_for_test();
+    clear_live_guest_runtime_state_for_test();
+    object::load_text_symbols(8, "/usr/bin/demo", "0000000000000010 T target_fn\n").unwrap();
+    manager::attach_symbol(8, "/usr/bin/demo", "target_fn", 16, false).unwrap();
+    manager::install_mock_patch_backend_for_test();
+    manager::activate_for_mapping_for_test(8, "/usr/bin/demo", 0x1000, 0x400000, 0, 0x8100, 0x1111_1111)
+        .unwrap();
+    manager::activate_for_mapping_for_test(8, "/usr/bin/demo", 0x2000, 0x400000, 0, 0x8200, 0x2222_2222)
+        .unwrap();
+    let _live_state = install_current_mm(8, 0x2000);
+
+    let regs = [0u64; 31];
+    let result = handler::handle_guest_brk_for_test(8, 0x400010, 0, &regs, 0b0000);
+
+    assert!(matches!(result, handler::UprobeBrkHandleResult::ProbeHitSingleStep));
+    assert_eq!(manager::lookup_active_for_mm_for_test(8, 0x1000, 0x400010).unwrap().hits, 0);
+    assert_eq!(manager::lookup_active_for_mm_for_test(8, 0x2000, 0x400010).unwrap().hits, 1);
+}
+
+#[test]
+fn ret_entry_hit_uses_current_mm_instance_metadata() {
+    let _guard = lock_test_state();
+    manager::init();
+    manager::clear_all_for_test();
+    handler::clear_state_for_test();
+    return_stack::clear_all_for_test();
+    clear_live_guest_runtime_state_for_test();
+    object::load_text_symbols(9, "/usr/bin/demo", "0000000000000010 T target_fn\n").unwrap();
+    manager::attach_symbol(9, "/usr/bin/demo", "target_fn", 17, true).unwrap();
+    manager::install_mock_patch_backend_for_test();
+    manager::activate_for_mapping_for_test(9, "/usr/bin/demo", 0x1000, 0x400000, 0, 0x8300, 0x3333_3333)
+        .unwrap();
+    manager::activate_for_mapping_for_test(9, "/usr/bin/demo", 0x2000, 0x400000, 0, 0x8400, 0x4444_4444)
+        .unwrap();
+    manager::set_mock_patch_result_for_test(0x9000, 0xd65f03c0, 0);
+    let _live_state = install_current_mm(9, 0x2000);
+
+    let mut regs = [0u64; 31];
+    regs[30] = 0x5000;
+    let result = handler::handle_guest_brk_for_test(9, 0x400010, 0, &regs, 0b0000);
+
+    assert!(matches!(result, handler::UprobeBrkHandleResult::ProbeHitSingleStep));
+    assert!(return_stack::list_for_test(9, 0, 0x1000).is_empty());
+    assert_eq!(return_stack::list_for_test(9, 0, 0x2000).len(), 1);
+}
+
+#[test]
+fn ret_return_hit_updates_hits_for_matching_mm_instance_only() {
+    let _guard = lock_test_state();
+    manager::init();
+    manager::clear_all_for_test();
+    handler::clear_state_for_test();
+    return_stack::clear_all_for_test();
+    clear_live_guest_runtime_state_for_test();
+    object::load_text_symbols(10, "/usr/bin/demo", "0000000000000010 T target_fn\n").unwrap();
+    manager::attach_symbol(10, "/usr/bin/demo", "target_fn", 18, true).unwrap();
+    manager::install_mock_patch_backend_for_test();
+    manager::activate_for_mapping_for_test(10, "/usr/bin/demo", 0x1000, 0x400000, 0, 0x8500, 0x5555_5555)
+        .unwrap();
+    manager::activate_for_mapping_for_test(10, "/usr/bin/demo", 0x2000, 0x400000, 0, 0x8600, 0x6666_6666)
+        .unwrap();
+    manager::set_mock_patch_result_for_test(0x9000, 0xd65f03c0, 0);
+    let _live_state = install_current_mm(10, 0x2000);
+
+    let mut regs = [0u64; 31];
+    regs[30] = 0x5000;
+    assert!(matches!(
+        handler::handle_guest_brk_for_test(10, 0x400010, 0, &regs, 0b0000),
+        handler::UprobeBrkHandleResult::ProbeHitSingleStep
+    ));
+    assert!(handler::handle_software_step());
+
+    let result = handler::handle_guest_brk_for_test(10, 0x5000, 0, &regs, 0b0000);
+
+    assert!(matches!(result, handler::UprobeBrkHandleResult::ProbeHitSingleStep));
+    assert_eq!(manager::lookup_active_for_mm_for_test(10, 0x1000, 0x400010).unwrap().hits, 0);
+    assert_eq!(manager::lookup_active_for_mm_for_test(10, 0x2000, 0x400010).unwrap().hits, 1);
 }

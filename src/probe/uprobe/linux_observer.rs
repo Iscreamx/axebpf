@@ -57,8 +57,24 @@ pub fn on_munmap(maps: &ProcessMaps, vm_id: u32, mm: u64, start: u64, end: u64) 
 
 pub fn on_exit_mm(maps: &ProcessMaps, vm_id: u32, mm: u64) {
     maps.apply(ObserverEvent::ExitMm { vm_id, mm });
+    if let Err(err) = manager::cleanup_mm(vm_id, mm) {
+        log::warn!(
+            "guest_uprobe: failed to cleanup instances for exit_mm vm{} mm={:#x}: {}",
+            vm_id,
+            mm,
+            err
+        );
+    }
 }
 
 pub fn on_exit(maps: &ProcessMaps, vm_id: u32, pid: u32) {
     maps.apply(ObserverEvent::Exit { vm_id, pid });
+    if let Err(err) = manager::cleanup_pid(vm_id, pid) {
+        log::warn!(
+            "guest_uprobe: failed to cleanup instances for exit vm{} pid={}: {}",
+            vm_id,
+            pid,
+            err
+        );
+    }
 }

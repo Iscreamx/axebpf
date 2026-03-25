@@ -31,6 +31,7 @@ pub enum UprobeStage2ExecFaultResult {
 enum UprobeSingleStepState {
     ReinjectEntryBrk {
         vm_id: u32,
+        mm: u64,
         pc: u64,
         hva: usize,
     },
@@ -128,6 +129,7 @@ fn current_mm(vm_id: u32) -> Option<u64> {
 
 fn begin_single_step_for_entry(
     vm_id: u32,
+    mm: u64,
     pc: u64,
     hva: usize,
     saved_insn: u32,
@@ -138,7 +140,10 @@ fn begin_single_step_for_entry(
         if pending.contains_key(&cpu_id) {
             return UprobeBrkHandleResult::ProbeHitFallbackSkip;
         }
-        pending.insert(cpu_id, UprobeSingleStepState::ReinjectEntryBrk { vm_id, pc, hva });
+        pending.insert(
+            cpu_id,
+            UprobeSingleStepState::ReinjectEntryBrk { vm_id, mm, pc, hva },
+        );
     }
 
     if let Err(err) = super::manager::restore_instruction_for_step(hva, saved_insn) {
@@ -216,10 +221,11 @@ fn run_uprobe_program(
 
 fn handle_guest_uprobe_hit(
     vm_id: u32,
+    mm: u64,
     pc: u64,
     regs: &[u64; 31],
 ) -> UprobeBrkHandleResult {
-    let Some(entry) = super::manager::increment_active_hits(vm_id, pc) else {
+    let Some(entry) = super::manager::increment_active_hits_for_mm(vm_id, mm, pc) else {
         return UprobeBrkHandleResult::Unhandled;
     };
     log::info!(
@@ -241,7 +247,7 @@ fn handle_guest_uprobe_hit(
     #[cfg(feature = "runtime")]
     run_uprobe_program(&entry, current_vcpu_id(), regs);
 
-    begin_single_step_for_entry(vm_id, pc, entry.hva, entry.saved_insn)
+    begin_single_step_for_entry(vm_id, entry.mm, pc, entry.hva, entry.saved_insn)
 }
 
 fn handle_guest_uretprobe_entry_hit(
@@ -259,7 +265,7 @@ fn handle_guest_uretprobe_entry_hit(
             entry.symbol,
             pc
         );
-        return begin_single_step_for_entry(vm_id, pc, entry.hva, entry.saved_insn);
+        return begin_single_step_for_entry(vm_id, entry.mm, pc, entry.hva, entry.saved_insn);
     }
 
     match super::manager::acquire_return_brk(entry.vm_id, entry.mm, return_gva) {
@@ -330,7 +336,7 @@ fn handle_guest_uretprobe_entry_hit(
         }
     }
 
-    begin_single_step_for_entry(vm_id, pc, entry.hva, entry.saved_insn)
+    begin_single_step_for_entry(vm_id, entry.mm, pc, entry.hva, entry.saved_insn)
 }
 
 fn handle_guest_uretprobe_return_hit(
@@ -353,7 +359,8 @@ fn handle_guest_uretprobe_return_hit(
         }
     };
 
-    let Some(active) = super::manager::increment_active_hits(entry.vm_id, entry.entry_pc) else {
+    let Some(active) = super::manager::increment_active_hits_for_mm(entry.vm_id, entry.mm, entry.entry_pc)
+    else {
         log::warn!(
             "guest_uretprobe: active probe missing for return hit vm{} entry_pc={:#x} return_pc={:#x}",
             entry.vm_id,
@@ -397,14 +404,18 @@ pub fn handle_guest_brk(
         return UprobeBrkHandleResult::Unhandled;
     }
 
-    if let Some(active) = super::manager::lookup_active(vm_id, pc) {
+    let current_mm = current_mm(vm_id);
+
+    if let Some(mm) = current_mm
+        && let Some(active) = super::manager::lookup_active_for_mm(vm_id, mm, pc)
+    {
         if active.is_ret {
             return handle_guest_uretprobe_entry_hit(vm_id, pc, regs, active);
         }
-        return handle_guest_uprobe_hit(vm_id, pc, regs);
+        return handle_guest_uprobe_hit(vm_id, mm, pc, regs);
     }
 
-    if let Some(mm) = current_mm(vm_id)
+    if let Some(mm) = current_mm
         && let Some(entry) = super::return_stack::pop(vm_id, current_vcpu_id(), mm, pc)
     {
         return handle_guest_uretprobe_return_hit(vm_id, pc, regs, entry);
@@ -423,9 +434,9 @@ pub fn handle_software_step() -> bool {
     };
 
     match state {
-        UprobeSingleStepState::ReinjectEntryBrk { vm_id, pc, hva } => {
+        UprobeSingleStepState::ReinjectEntryBrk { vm_id, mm, pc, hva } => {
             if let Err(err) = super::manager::reinject_breakpoint(hva) {
-                let _ = super::manager::remove_active(vm_id, pc);
+                let _ = super::manager::remove_active_for_mm(vm_id, mm, pc);
                 log::warn!(
                     "guest_uprobe: failed to reinject BRK vm{} pc={:#x}: {}",
                     vm_id,

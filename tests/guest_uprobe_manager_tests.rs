@@ -4,7 +4,8 @@ use std::string::String;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use axebpf::probe::uprobe::return_stack::{self, ReturnEntry};
-use axebpf::probe::uprobe::{manager, object};
+use axebpf::probe::uprobe::process_maps::ProcessMaps;
+use axebpf::probe::uprobe::{linux_observer, manager, object};
 
 fn test_guard() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -125,4 +126,40 @@ fn disable_active_ret_probe_cleans_return_state() {
 
     assert!(return_stack::list_for_test(4, 0, 0x1000).is_empty());
     assert!(manager::lookup_return_brk_for_test(4, 0x1000, 0x5000).is_none());
+}
+
+#[test]
+fn same_site_cannot_register_uprobe_and_uretprobe_together() {
+    let _guard = test_guard();
+    manager::init();
+    manager::clear_all_for_test();
+    object::load_text_symbols(5, "/usr/bin/demo", "0000000000000010 T target_fn\n").unwrap();
+
+    manager::attach_symbol(5, "/usr/bin/demo", "target_fn", 13, false).unwrap();
+
+    let err = manager::attach_symbol(5, "/usr/bin/demo", "target_fn", 14, true).unwrap_err();
+    assert_eq!(err, "duplicate uprobe registration");
+}
+
+#[test]
+fn list_all_exposes_instance_metadata_for_active_entries() {
+    let _guard = test_guard();
+    let maps = ProcessMaps::new();
+    manager::init();
+    manager::clear_all_for_test();
+    object::load_text_symbols(6, "/usr/bin/demo", "0000000000000010 T target_fn\n").unwrap();
+    manager::attach_symbol(6, "/usr/bin/demo", "target_fn", 15, false).unwrap();
+    manager::install_mock_patch_backend_for_test();
+
+    linux_observer::on_exec(&maps, 6, 41, 41, 0x3000, "demo");
+    linux_observer::on_mmap(&maps, 6, 0x3000, 0x400000, 0x401000, 0, "/usr/bin/demo");
+
+    let active = manager::list_all()
+        .into_iter()
+        .find(|entry| entry.state == manager::UprobeState::Active)
+        .unwrap();
+    assert_eq!(active.mm, 0x3000);
+    assert_eq!(active.pid, 41);
+    assert_eq!(active.tgid, 41);
+    assert_eq!(active.comm, "demo");
 }
