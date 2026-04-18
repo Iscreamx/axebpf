@@ -19,6 +19,7 @@ const EXECVE_SYM: &str = "__arm64_sys_execve";
 const EXECVEAT_SYM: &str = "__arm64_sys_execveat";
 const VM_MMAP_PGOFF_SYM: &str = "vm_mmap_pgoff";
 const RETRY_ACTIVATE_SYM: &str = "__arm64_sys_nanosleep";
+const EXIT_MMAP_SYM: &str = "exit_mmap";
 const MAX_EXEC_PATH_LEN: usize = 256;
 
 type VmContextidrFn = fn(vm_id: u32) -> axerrno::AxResult<u32>;
@@ -48,6 +49,7 @@ struct VmObserverState {
     execveat_gva: Option<u64>,
     vm_mmap_pgoff_gva: Option<u64>,
     retry_activate_gva: Option<u64>,
+    exit_mmap_gva: Option<u64>,
 }
 
 static VM_OBSERVERS: Mutex<BTreeMap<u32, VmObserverState>> = Mutex::new(BTreeMap::new());
@@ -175,8 +177,16 @@ fn classify_retry_probe(vm_id: u32, probe_gva: u64) -> bool {
         .is_some_and(|state| state.retry_activate_gva == Some(probe_gva))
 }
 
+fn classify_exit_probe(vm_id: u32, probe_gva: u64) -> bool {
+    VM_OBSERVERS
+        .lock()
+        .get(&vm_id)
+        .is_some_and(|state| state.exit_mmap_gva == Some(probe_gva))
+}
+
 fn current_tokens(vm_id: u32) -> Result<(u32, u64), &'static str> {
-    let mm_token = addr_translate::vm_ttbr0_el1(vm_id).map_err(|_| "VM TTBR0_EL1 hook not registered")?;
+    let mm_token =
+        addr_translate::vm_ttbr0_el1(vm_id).map_err(|_| "VM TTBR0_EL1 hook not registered")?;
     let proc_token = proc_token_from_live_state(vm_id)
         .or_else(|| vm_contextidr_el1(vm_id).ok())
         .unwrap_or_else(|| fold_runtime_token(mm_token));
@@ -188,6 +198,14 @@ fn lookup_exec_intent(vm_id: u32, proc_token: u32, mm_token: u64) -> Option<Exec
     if let Some(exec) = EXEC_INTENTS.lock().get(&(vm_id, proc_token)).cloned()
         && manager::has_pending_path(vm_id, &exec.exec_path)
     {
+        log::debug!(
+            "guest_uprobe_observer_lookup_exec: vm{} proc={:#x} mm={:#x} source=proc path={} intent_mm={:#x}",
+            vm_id,
+            proc_token,
+            mm_token,
+            exec.exec_path,
+            exec.mm_token
+        );
         return Some(exec);
     }
 
@@ -204,9 +222,40 @@ fn lookup_exec_intent(vm_id: u32, proc_token: u32, mm_token: u64) -> Option<Exec
         }
     }
 
-    latest_matchable
-        .map(|(_, exec)| exec)
-        .or_else(|| LATEST_EXEC_INTENTS.lock().get(&vm_id).cloned())
+    if let Some((sequence, exec)) = latest_matchable {
+        log::debug!(
+            "guest_uprobe_observer_lookup_exec: vm{} proc={:#x} mm={:#x} source=path seq={} path={} intent_proc={:#x} intent_mm={:#x}",
+            vm_id,
+            proc_token,
+            mm_token,
+            sequence,
+            exec.exec_path,
+            exec.proc_token,
+            exec.mm_token
+        );
+        return Some(exec);
+    }
+
+    let latest = LATEST_EXEC_INTENTS.lock().get(&vm_id).cloned();
+    if let Some(exec) = latest.clone() {
+        log::debug!(
+            "guest_uprobe_observer_lookup_exec: vm{} proc={:#x} mm={:#x} source=latest path={} intent_proc={:#x} intent_mm={:#x}",
+            vm_id,
+            proc_token,
+            mm_token,
+            exec.exec_path,
+            exec.proc_token,
+            exec.mm_token
+        );
+    } else {
+        log::debug!(
+            "guest_uprobe_observer_lookup_exec: vm{} proc={:#x} mm={:#x} source=miss",
+            vm_id,
+            proc_token,
+            mm_token
+        );
+    }
+    latest
 }
 
 fn record_execve(
@@ -241,23 +290,26 @@ fn record_execve(
         exec_path: exec_path.to_string(),
     };
     let sequence = EXEC_INTENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    EXEC_INTENTS.lock().insert(
-        (vm_id, proc_token),
-        exec_intent.clone(),
-    );
+    EXEC_INTENTS
+        .lock()
+        .insert((vm_id, proc_token), exec_intent.clone());
     LATEST_EXEC_INTENTS.lock().insert(vm_id, exec_intent);
     LATEST_EXEC_INTENTS_BY_PATH.lock().insert(
         (vm_id, exec_path.to_string()),
-        (sequence, ExecIntent {
-            vm_id,
-            proc_token,
-            mm_token,
-            exec_path: exec_path.to_string(),
-        }),
+        (
+            sequence,
+            ExecIntent {
+                vm_id,
+                proc_token,
+                mm_token,
+                exec_path: exec_path.to_string(),
+            },
+        ),
     );
     log::debug!(
-        "guest_uprobe_observer: recorded exec intent vm{} proc={:#x} mm={:#x} path={}",
+        "guest_uprobe_observer: recorded exec intent vm{} seq={} proc={:#x} mm={:#x} path={}",
         vm_id,
+        sequence,
         proc_token,
         mm_token,
         exec_path
@@ -315,8 +367,14 @@ fn handle_exec_entry(vm_id: u32, probe_gva: u64, regs: &[u64; 31]) {
         mm_token,
         exec_path
     );
-    if let Err(err) = record_execve(runtime_process_maps(), vm_id, symbol, proc_token, mm_token, &exec_path)
-    {
+    if let Err(err) = record_execve(
+        runtime_process_maps(),
+        vm_id,
+        symbol,
+        proc_token,
+        mm_token,
+        &exec_path,
+    ) {
         log::warn!(
             "guest_uprobe_observer: failed to record exec intent vm{} symbol={}: {}",
             vm_id,
@@ -399,6 +457,18 @@ fn record_vm_mmap_return(
         );
         return Ok(0);
     }
+    log::info!(
+        "guest_uprobe_observer_mmap_match: vm{} proc={:#x} mm={:#x} start={:#x} len={:#x} file_offset={:#x} path={} intent_proc={:#x} intent_mm={:#x}",
+        vm_id,
+        proc_token,
+        mm_token,
+        start,
+        intent.len,
+        intent.file_offset,
+        exec.exec_path,
+        exec.proc_token,
+        exec.mm_token
+    );
     if let Some(expected_start) = object::lookup_main_text_start(vm_id, &exec.exec_path)
         && expected_start != start
     {
@@ -457,18 +527,15 @@ fn retry_pending_activation(
     maps: &ProcessMaps,
     vm_id: u32,
     mm_token: u64,
-) -> Result<Option<(String, u64, usize)>, &'static str> {
-    let Some(mapping) = maps.lookup_main_text(vm_id, mm_token) else {
-        return Ok(None);
-    };
-    if !manager::has_pending_path(vm_id, &mapping.guest_path) {
-        return Ok(None);
-    }
-    let activated = manager::try_activate_for_mm(maps, vm_id, mm_token)?;
-    if activated == 0 {
-        return Ok(None);
-    }
-    Ok(Some((mapping.guest_path, mapping.start, activated)))
+) -> Result<usize, &'static str> {
+    manager::try_activate_for_mm(maps, vm_id, mm_token)
+}
+
+pub fn retry_pending_activation_for_current_mm(
+    vm_id: u32,
+    mm_token: u64,
+) -> Result<usize, &'static str> {
+    retry_pending_activation(runtime_process_maps(), vm_id, mm_token)
 }
 
 fn handle_mmap_entry(vm_id: u32, regs: &[u64; 31]) {
@@ -497,7 +564,8 @@ fn handle_mmap_entry(vm_id: u32, regs: &[u64; 31]) {
         prot,
         pgoff
     );
-    if let Err(err) = record_vm_mmap_entry(vm_id, proc_token, mm_token, file_backed, len, prot, pgoff)
+    if let Err(err) =
+        record_vm_mmap_entry(vm_id, proc_token, mm_token, file_backed, len, prot, pgoff)
     {
         log::warn!(
             "guest_uprobe_observer: failed to record mmap entry vm{} proc={:#x} mm={:#x}: {}",
@@ -529,7 +597,9 @@ fn handle_mmap_return(vm_id: u32, regs: &[u64; 31]) {
         mm_token,
         start
     );
-    if let Err(err) = record_vm_mmap_return(runtime_process_maps(), vm_id, proc_token, mm_token, start) {
+    if let Err(err) =
+        record_vm_mmap_return(runtime_process_maps(), vm_id, proc_token, mm_token, start)
+    {
         log::warn!(
             "guest_uprobe_observer: failed to record mmap return vm{} proc={:#x} mm={:#x}: {}",
             vm_id,
@@ -553,18 +623,16 @@ fn handle_retry_activation_entry(vm_id: u32) {
         }
     };
     match retry_pending_activation(runtime_process_maps(), vm_id, mm_token) {
-        Ok(Some((guest_path, start, activated))) => {
+        Ok(activated) if activated > 0 => {
             log::info!(
-                "guest_uprobe_activate: vm{} proc={:#x} mm={:#x} path={} start={:#x} count={} reason=runtime_retry",
+                "guest_uprobe_activate: vm{} proc={:#x} mm={:#x} count={} reason=runtime_retry",
                 vm_id,
                 proc_token,
                 mm_token,
-                guest_path,
-                start,
                 activated
             );
         }
-        Ok(None) => {}
+        Ok(_) => {}
         Err(err) => {
             log::warn!(
                 "guest_uprobe_observer: retry activation failed vm{} proc={:#x} mm={:#x}: {}",
@@ -575,6 +643,27 @@ fn handle_retry_activation_entry(vm_id: u32) {
             );
         }
     }
+}
+
+fn handle_exit_mmap_entry(vm_id: u32) {
+    let (proc_token, mm_token) = match current_tokens(vm_id) {
+        Ok(tokens) => tokens,
+        Err(err) => {
+            log::warn!(
+                "guest_uprobe_observer: missing exit observer tokens vm{}: {}",
+                vm_id,
+                err
+            );
+            return;
+        }
+    };
+    log::info!(
+        "guest_uprobe_observer_exit_mmap: vm{} proc={:#x} mm={:#x}",
+        vm_id,
+        proc_token,
+        mm_token
+    );
+    linux_observer::on_exit_mm(runtime_process_maps(), vm_id, mm_token);
 }
 
 fn runtime_observer_callback(
@@ -596,6 +685,10 @@ fn runtime_observer_callback(
             }
             if classify_retry_probe(vm_id, probe_gva) {
                 handle_retry_activation_entry(vm_id);
+                return;
+            }
+            if classify_exit_probe(vm_id, probe_gva) {
+                handle_exit_mmap_entry(vm_id);
             }
         }
         HiddenProbePhase::Return => {
@@ -616,7 +709,9 @@ pub fn ensure_registered_for_vm(vm_id: u32) -> Result<usize, &'static str> {
     let mut registered = 0usize;
     let mut state = *VM_OBSERVERS.lock().entry(vm_id).or_default();
 
-    if state.execve_gva.is_none() && let Some(gva) = guest_symbols::lookup_addr(vm_id, EXECVE_SYM) {
+    if state.execve_gva.is_none()
+        && let Some(gva) = guest_symbols::lookup_addr(vm_id, EXECVE_SYM)
+    {
         guest_kprobe::attach_hidden_brk(vm_id, gva, false, runtime_observer_callback)?;
         state.execve_gva = Some(gva);
         registered += 1;
@@ -646,6 +741,14 @@ pub fn ensure_registered_for_vm(vm_id: u32) -> Result<usize, &'static str> {
         registered += 1;
     }
 
+    if state.exit_mmap_gva.is_none()
+        && let Some(gva) = guest_symbols::lookup_addr(vm_id, EXIT_MMAP_SYM)
+    {
+        guest_kprobe::attach_hidden_brk(vm_id, gva, false, runtime_observer_callback)?;
+        state.exit_mmap_gva = Some(gva);
+        registered += 1;
+    }
+
     VM_OBSERVERS.lock().insert(vm_id, state);
     Ok(registered)
 }
@@ -663,7 +766,11 @@ pub fn record_execve_for_test(
 }
 
 #[cfg(any(test, feature = "test-utils"))]
-pub fn lookup_exec_intent_for_test(vm_id: u32, proc_token: u32, mm_token: u64) -> Option<ExecIntent> {
+pub fn lookup_exec_intent_for_test(
+    vm_id: u32,
+    proc_token: u32,
+    mm_token: u64,
+) -> Option<ExecIntent> {
     let exec = EXEC_INTENTS.lock().get(&(vm_id, proc_token)).cloned()?;
     (exec.mm_token == mm_token).then_some(exec)
 }
@@ -698,7 +805,7 @@ pub fn retry_pending_activation_for_test(
     vm_id: u32,
     mm_token: u64,
 ) -> Result<usize, &'static str> {
-    Ok(retry_pending_activation(maps, vm_id, mm_token)?.map_or(0, |(_, _, count)| count))
+    retry_pending_activation(maps, vm_id, mm_token)
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -721,6 +828,16 @@ pub fn fallback_proc_token_for_test(raw_token: u64) -> u32 {
 }
 
 #[cfg(any(test, feature = "test-utils"))]
+pub fn handle_exit_entry_for_test(vm_id: u32) {
+    let _ = vm_id;
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn handle_exit_mmap_entry_for_test(vm_id: u32) {
+    handle_exit_mmap_entry(vm_id)
+}
+
+#[cfg(any(test, feature = "test-utils"))]
 pub fn clear_all_for_test() {
     let states = VM_OBSERVERS.lock().clone();
     VM_OBSERVERS.lock().clear();
@@ -736,9 +853,10 @@ pub fn clear_all_for_test() {
             state.execveat_gva,
             state.vm_mmap_pgoff_gva,
             state.retry_activate_gva,
+            state.exit_mmap_gva,
         ]
-            .into_iter()
-            .flatten()
+        .into_iter()
+        .flatten()
         {
             let _ = guest_kprobe::detach(vm_id, gva);
         }

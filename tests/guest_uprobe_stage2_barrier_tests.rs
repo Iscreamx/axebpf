@@ -65,8 +65,16 @@ fn non_target_fault_single_steps_and_exact_target_fault_releases_exec_barrier() 
     manager::install_mock_patch_backend_for_test();
     manager::set_mock_patch_result_for_test(0x8000, 0x1234_5678, 0x9000);
 
-    manager::activate_for_mapping_for_test(1, "/usr/bin/demo", 0x1000, 0x400000, 0, 0x8000, 0x1234_5678)
-        .unwrap();
+    manager::activate_for_mapping_for_test(
+        1,
+        "/usr/bin/demo",
+        0x1000,
+        0x400000,
+        0,
+        0x8000,
+        0x1234_5678,
+    )
+    .unwrap();
 
     let state = match stage2_hook_state().lock() {
         Ok(guard) => guard,

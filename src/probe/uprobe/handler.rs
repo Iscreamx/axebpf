@@ -48,7 +48,8 @@ enum UprobeSingleStepState {
     },
 }
 
-static SINGLE_STEP_STATE: Mutex<BTreeMap<usize, UprobeSingleStepState>> = Mutex::new(BTreeMap::new());
+static SINGLE_STEP_STATE: Mutex<BTreeMap<usize, UprobeSingleStepState>> =
+    Mutex::new(BTreeMap::new());
 
 pub fn should_emit_for_filter(
     pid_filter: Option<u32>,
@@ -199,11 +200,7 @@ fn begin_single_step_for_return(
 }
 
 #[cfg(feature = "runtime")]
-fn run_uprobe_program(
-    entry: &super::manager::ActiveUprobeEntry,
-    vcpu_id: u32,
-    regs: &[u64; 31],
-) {
+fn run_uprobe_program(entry: &super::manager::ActiveUprobeEntry, vcpu_id: u32, regs: &[u64; 31]) {
     let regs = guest_arg_regs(regs);
     let mut ctx = build_uprobe_ctx(
         entry.vm_id,
@@ -274,6 +271,7 @@ fn handle_guest_uretprobe_entry_hit(
                 vm_id: entry.vm_id,
                 vcpu_id: current_vcpu_id(),
                 mm: entry.mm,
+                instance_id: entry.instance_id,
                 entry_pc: entry.pc,
                 return_gva,
                 return_hva,
@@ -288,7 +286,8 @@ fn handle_guest_uretprobe_entry_hit(
             if let Err(err) = push_result {
                 match super::manager::release_return_brk(entry.vm_id, entry.mm, return_gva) {
                     Ok(false) => {
-                        let _ = super::manager::restore_instruction_for_step(return_hva, saved_insn);
+                        let _ =
+                            super::manager::restore_instruction_for_step(return_hva, saved_insn);
                     }
                     Ok(true) => {}
                     Err(release_err) => {
@@ -345,7 +344,11 @@ fn handle_guest_uretprobe_return_hit(
     regs: &[u64; 31],
     entry: super::return_stack::ReturnEntry,
 ) -> UprobeBrkHandleResult {
-    let should_reinject = match super::manager::release_return_brk(entry.vm_id, entry.mm, entry.return_gva) {
+    let should_reinject = match super::manager::release_return_brk(
+        entry.vm_id,
+        entry.mm,
+        entry.return_gva,
+    ) {
         Ok(should_reinject) => should_reinject,
         Err(err) => {
             log::warn!(
@@ -359,7 +362,8 @@ fn handle_guest_uretprobe_return_hit(
         }
     };
 
-    let Some(active) = super::manager::increment_active_hits_for_mm(entry.vm_id, entry.mm, entry.entry_pc)
+    let Some(active) =
+        super::manager::increment_active_hits_for_mm(entry.vm_id, entry.mm, entry.entry_pc)
     else {
         log::warn!(
             "guest_uretprobe: active probe missing for return hit vm{} entry_pc={:#x} return_pc={:#x}",
@@ -367,7 +371,13 @@ fn handle_guest_uretprobe_return_hit(
             entry.entry_pc,
             pc
         );
-        return begin_single_step_for_return(vm_id, pc, entry.return_hva, entry.saved_insn, should_reinject);
+        return begin_single_step_for_return(
+            vm_id,
+            pc,
+            entry.return_hva,
+            entry.saved_insn,
+            should_reinject,
+        );
     };
 
     log::info!(
@@ -390,7 +400,13 @@ fn handle_guest_uretprobe_return_hit(
     #[cfg(feature = "runtime")]
     run_uprobe_program(&active, entry.vcpu_id, regs);
 
-    begin_single_step_for_return(vm_id, pc, entry.return_hva, entry.saved_insn, should_reinject)
+    begin_single_step_for_return(
+        vm_id,
+        pc,
+        entry.return_hva,
+        entry.saved_insn,
+        should_reinject,
+    )
 }
 
 pub fn handle_guest_brk(
@@ -422,6 +438,36 @@ pub fn handle_guest_brk(
     }
     if let Some(entry) = super::return_stack::pop_for_vcpu(vm_id, current_vcpu_id(), pc) {
         return handle_guest_uretprobe_return_hit(vm_id, pc, regs, entry);
+    }
+
+    if let Some(mm) = current_mm {
+        match super::linux_runtime_observer::retry_pending_activation_for_current_mm(vm_id, mm) {
+            Ok(count) if count > 0 => {
+                log::info!(
+                    "guest_uprobe: BRK-triggered activation vm{} mm={:#x} pc={:#x} count={}",
+                    vm_id,
+                    mm,
+                    pc,
+                    count
+                );
+                if let Some(active) = super::manager::lookup_active_for_mm(vm_id, mm, pc) {
+                    if active.is_ret {
+                        return handle_guest_uretprobe_entry_hit(vm_id, pc, regs, active);
+                    }
+                    return handle_guest_uprobe_hit(vm_id, mm, pc, regs);
+                }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                log::debug!(
+                    "guest_uprobe: BRK-triggered activation skipped vm{} mm={:#x} pc={:#x}: {}",
+                    vm_id,
+                    mm,
+                    pc,
+                    err
+                );
+            }
+        }
     }
 
     UprobeBrkHandleResult::Unhandled
@@ -559,9 +605,6 @@ pub fn clear_state_for_test() {
 }
 
 #[cfg(any(test, feature = "test-utils"))]
-pub fn handle_stage2_exec_fault_for_test(
-    vm_id: u32,
-    gpa: u64,
-) -> UprobeStage2ExecFaultResult {
+pub fn handle_stage2_exec_fault_for_test(vm_id: u32, gpa: u64) -> UprobeStage2ExecFaultResult {
     handle_stage2_exec_fault(vm_id, gpa)
 }

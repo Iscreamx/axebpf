@@ -7,11 +7,11 @@ use axebpf::probe::kprobe::addr_translate::{
     clear_gva_to_hva_hook_for_test as clear_kernel_gva_to_hva_hook_for_test,
     register_gva_to_hva_hook as register_kernel_gva_to_hva_hook,
 };
-use axebpf::probe::uprobe::linux_runtime_observer;
 use axebpf::probe::uprobe::addr_translate::{
     clear_gva_to_hva_hook_for_test as clear_user_gva_to_hva_hook_for_test,
     register_gva_to_hva_hook as register_user_gva_to_hva_hook,
 };
+use axebpf::probe::uprobe::linux_runtime_observer;
 use axebpf::probe::uprobe::process_maps::ProcessMaps;
 use axerrno::AxResult;
 
@@ -93,7 +93,39 @@ fn execve_wrapper_reads_path_from_guest_pt_regs_x0() {
     let path = linux_runtime_observer::read_exec_path_from_regs_for_test(
         1,
         "__arm64_sys_execve",
-        &[PT_REGS_GVA, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        &[
+            PT_REGS_GVA,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ],
     )
     .unwrap();
     assert_eq!(path, "/usr/bin/ax_uprobe_demo");
@@ -123,7 +155,39 @@ fn execveat_wrapper_reads_path_from_guest_pt_regs_x1() {
     let path = linux_runtime_observer::read_exec_path_from_regs_for_test(
         1,
         "__arm64_sys_execveat",
-        &[PT_REGS_GVA, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        &[
+            PT_REGS_GVA,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ],
     )
     .unwrap();
     assert_eq!(path, "/usr/bin/ax_uprobe_demo");

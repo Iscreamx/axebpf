@@ -1,7 +1,7 @@
 #![cfg(feature = "guest-uprobe")]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axebpf::probe::uprobe::addr_translate::{
     read_user_cstring_with_vm, register_gva_to_hva_hook, register_vm_ttbr0_hook,
@@ -38,7 +38,9 @@ fn user_string_reader_returns_absolute_exec_path() {
 #[test]
 fn user_string_reader_rejects_missing_nul() {
     let _guard = TEST_LOCK.lock().unwrap();
-    let bytes = Box::leak(Box::new(*b"/usr/bin/no-nul................................"));
+    let bytes = Box::leak(Box::new(
+        *b"/usr/bin/no-nul................................",
+    ));
     BASE_BYTES_PTR.store(bytes.as_ptr() as usize, Ordering::Relaxed);
     register_gva_to_hva_hook(mock_gva_to_hva_base);
 

@@ -3,7 +3,7 @@
 use std::sync::Mutex;
 
 use axebpf::probe::uprobe::process_maps::ProcessMaps;
-use axebpf::probe::uprobe::{linux_runtime_observer, manager, object};
+use axebpf::probe::uprobe::{linux_observer, linux_runtime_observer, manager, object};
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -14,8 +14,12 @@ fn executable_file_backed_mmap_return_activates_matching_pending_probe() {
     manager::init();
     manager::clear_all_for_test();
     linux_runtime_observer::clear_all_for_test();
-    object::load_text_symbols(1, "/usr/bin/ax_uprobe_demo", "0000000000000040 T target_fn\n")
-        .unwrap();
+    object::load_text_symbols(
+        1,
+        "/usr/bin/ax_uprobe_demo",
+        "0000000000000040 T target_fn\n",
+    )
+    .unwrap();
     manager::attach_symbol(1, "/usr/bin/ax_uprobe_demo", "target_fn", 7, false).unwrap();
     manager::install_mock_patch_backend_for_test();
 
@@ -43,8 +47,12 @@ fn executable_mmap_return_activates_pending_probe_after_exec_switches_mm() {
     manager::init();
     manager::clear_all_for_test();
     linux_runtime_observer::clear_all_for_test();
-    object::load_text_symbols(1, "/usr/bin/ax_uprobe_demo", "0000000000000040 T target_fn\n")
-        .unwrap();
+    object::load_text_symbols(
+        1,
+        "/usr/bin/ax_uprobe_demo",
+        "0000000000000040 T target_fn\n",
+    )
+    .unwrap();
     manager::attach_symbol(1, "/usr/bin/ax_uprobe_demo", "target_fn", 9, false).unwrap();
     manager::install_mock_patch_backend_for_test();
 
@@ -73,8 +81,12 @@ fn executable_mmap_return_uses_latest_pending_exec_intent_when_proc_token_change
     manager::init();
     manager::clear_all_for_test();
     linux_runtime_observer::clear_all_for_test();
-    object::load_text_symbols(1, "/usr/bin/ax_uprobe_demo", "0000000000000040 T target_fn\n")
-        .unwrap();
+    object::load_text_symbols(
+        1,
+        "/usr/bin/ax_uprobe_demo",
+        "0000000000000040 T target_fn\n",
+    )
+    .unwrap();
     manager::attach_symbol(1, "/usr/bin/ax_uprobe_demo", "target_fn", 11, false).unwrap();
     manager::install_mock_patch_backend_for_test();
 
@@ -103,8 +115,12 @@ fn executable_mmap_return_ignores_newer_exec_intent_without_pending_probe() {
     manager::init();
     manager::clear_all_for_test();
     linux_runtime_observer::clear_all_for_test();
-    object::load_text_symbols(1, "/usr/bin/ax_uprobe_demo", "0000000000000040 T target_fn\n")
-        .unwrap();
+    object::load_text_symbols(
+        1,
+        "/usr/bin/ax_uprobe_demo",
+        "0000000000000040 T target_fn\n",
+    )
+    .unwrap();
     manager::attach_symbol(1, "/usr/bin/ax_uprobe_demo", "target_fn", 13, false).unwrap();
     manager::install_mock_patch_backend_for_test();
 
@@ -198,4 +214,94 @@ fn anonymous_or_non_exec_mmap_is_ignored() {
             .is_ok()
     );
     assert!(maps.lookup_main_text(1, 0x2000).is_none());
+}
+
+#[test]
+fn executable_mmap_return_resolves_runtime_pc_with_segment_load_bias() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let maps = ProcessMaps::new();
+    manager::init();
+    manager::clear_all_for_test();
+    linux_runtime_observer::clear_all_for_test();
+    object::load_text_symbols(
+        2,
+        "/usr/lib/libdemo.so",
+        "\
+# axvisor-load-segment 0x2234 0x900 0x1234 0x5
+0000000000002256 T target_fn\n",
+    )
+    .unwrap();
+    manager::attach_symbol(2, "/usr/lib/libdemo.so", "target_fn", 21, false).unwrap();
+    manager::install_mock_patch_backend_for_test();
+
+    linux_runtime_observer::record_execve_for_test(
+        &maps,
+        2,
+        "__arm64_sys_execve",
+        0x99,
+        0x3000,
+        "/usr/lib/libdemo.so",
+    )
+    .unwrap();
+    linux_runtime_observer::record_vm_mmap_entry_for_test(2, 0x99, 0x3000, true, 0x1000, 0x5, 0x1)
+        .unwrap();
+    assert_eq!(
+        linux_runtime_observer::record_vm_mmap_return_for_test(&maps, 2, 0x99, 0x3000, 0x500000)
+            .unwrap(),
+        1
+    );
+
+    assert!(manager::lookup_active_for_mm_for_test(2, 0x3000, 0x500256).is_some());
+}
+
+#[test]
+fn munmap_of_shared_object_deactivates_old_instance_before_remap() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let maps = ProcessMaps::new();
+    manager::init();
+    manager::clear_all_for_test();
+    linux_runtime_observer::clear_all_for_test();
+    object::load_text_symbols(
+        3,
+        "/usr/lib/libdemo.so",
+        "\
+# axvisor-load-segment 0x2234 0x900 0x1234 0x5
+0000000000002256 T target_fn\n",
+    )
+    .unwrap();
+    manager::attach_symbol(3, "/usr/lib/libdemo.so", "target_fn", 22, false).unwrap();
+    manager::install_mock_patch_backend_for_test();
+
+    linux_observer::on_exec(&maps, 3, 41, 41, 0x4000, "demo");
+    assert_eq!(
+        linux_observer::on_mmap(
+            &maps,
+            3,
+            0x4000,
+            0x500000,
+            0x501000,
+            0x1000,
+            "/usr/lib/libdemo.so"
+        ),
+        1
+    );
+    assert!(manager::lookup_active_for_mm_for_test(3, 0x4000, 0x500256).is_some());
+
+    linux_observer::on_munmap(&maps, 3, 0x4000, 0x500000, 0x501000);
+    assert!(manager::lookup_active_for_mm_for_test(3, 0x4000, 0x500256).is_none());
+    assert_eq!(manager::instance_count_for_test(3), 0);
+
+    assert_eq!(
+        linux_observer::on_mmap(
+            &maps,
+            3,
+            0x4000,
+            0x600000,
+            0x601000,
+            0x1000,
+            "/usr/lib/libdemo.so"
+        ),
+        1
+    );
+    assert!(manager::lookup_active_for_mm_for_test(3, 0x4000, 0x600256).is_some());
 }

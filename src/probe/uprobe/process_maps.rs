@@ -4,6 +4,7 @@ extern crate alloc;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::vec::Vec;
 use spin::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +65,7 @@ struct ProcessState {
     tgid: u32,
     comm: String,
     main_text: Option<ProcessMapMatch>,
+    mappings: Vec<ProcessMapMatch>,
 }
 
 #[derive(Default)]
@@ -93,6 +95,7 @@ impl ProcessMaps {
                         tgid,
                         comm,
                         main_text: None,
+                        mappings: Vec::new(),
                     },
                 );
             }
@@ -107,6 +110,23 @@ impl ProcessMaps {
                 let Some(state) = inner.get_mut(&(vm_id, mm)) else {
                     return;
                 };
+                state.mappings.retain(|mapping| {
+                    !(mapping.start == start
+                        && mapping.end == end
+                        && mapping.file_offset == file_offset
+                        && mapping.guest_path == guest_path)
+                });
+                state.mappings.push(ProcessMapMatch {
+                    vm_id,
+                    pid: state.pid,
+                    tgid: state.tgid,
+                    mm,
+                    comm: state.comm.clone(),
+                    start,
+                    end,
+                    file_offset,
+                    guest_path: guest_path.clone(),
+                });
                 if !guest_path_matches_comm(&guest_path, &state.comm) {
                     return;
                 }
@@ -138,12 +158,16 @@ impl ProcessMaps {
                 {
                     state.main_text = None;
                 }
+                state
+                    .mappings
+                    .retain(|mapping| !ranges_overlap(mapping.start, mapping.end, start, end));
             }
             ObserverEvent::ExitMm { vm_id, mm } => {
                 inner.remove(&(vm_id, mm));
             }
             ObserverEvent::Exit { vm_id, pid } => {
-                inner.retain(|(event_vm_id, _), state| !(*event_vm_id == vm_id && state.pid == pid));
+                inner
+                    .retain(|(event_vm_id, _), state| !(*event_vm_id == vm_id && state.pid == pid));
             }
         }
     }
@@ -161,6 +185,24 @@ impl ProcessMaps {
     pub fn lookup_main_text(&self, vm_id: u32, mm: u64) -> Option<ProcessMapMatch> {
         let inner = self.inner.lock();
         inner.get(&(vm_id, mm))?.main_text.clone()
+    }
+
+    pub fn lookup_mappings_for_path(
+        &self,
+        vm_id: u32,
+        mm: u64,
+        guest_path: &str,
+    ) -> Vec<ProcessMapMatch> {
+        let inner = self.inner.lock();
+        let Some(state) = inner.get(&(vm_id, mm)) else {
+            return Vec::new();
+        };
+        state
+            .mappings
+            .iter()
+            .filter(|mapping| mapping.guest_path == guest_path)
+            .cloned()
+            .collect()
     }
 }
 

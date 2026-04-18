@@ -53,6 +53,16 @@ pub fn on_munmap(maps: &ProcessMaps, vm_id: u32, mm: u64, start: u64, end: u64) 
         start,
         end,
     });
+    if let Err(err) = manager::cleanup_range(vm_id, mm, start, end) {
+        log::warn!(
+            "guest_uprobe: failed to cleanup range for munmap vm{} mm={:#x} [{:#x}, {:#x}): {}",
+            vm_id,
+            mm,
+            start,
+            end,
+            err
+        );
+    }
 }
 
 pub fn on_exit_mm(maps: &ProcessMaps, vm_id: u32, mm: u64) {
