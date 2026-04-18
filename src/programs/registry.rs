@@ -74,6 +74,8 @@ impl ProgramRegistry {
 
     /// Check if any pre-compiled programs are available
     pub fn is_available() -> bool {
-        !bytecode::PRINTK.is_empty() || !bytecode::HPROBE_ENTRY.is_empty() || !bytecode::HPROBE_EXIT.is_empty()
+        !bytecode::PRINTK.is_empty()
+            || !bytecode::HPROBE_ENTRY.is_empty()
+            || !bytecode::HPROBE_EXIT.is_empty()
     }
 }

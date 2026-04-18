@@ -9,9 +9,9 @@ pub mod handler;
 pub mod manager;
 pub mod ops;
 
-pub use manager::{
-    attach, detach, disable, enable, init, list_all, register, unregister, KprobeRegistry,
-    KprobeState,
-};
 pub use handler::handle_breakpoint;
+pub use manager::{
+    KprobeRegistry, KprobeState, attach, detach, disable, enable, init, list_all, register,
+    unregister,
+};
 pub use ops::AxKprobeOps;

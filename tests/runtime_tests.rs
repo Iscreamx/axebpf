@@ -128,7 +128,11 @@ fn test_load_elf_printk() {
     assert!(program.is_ok(), "printk.o should load: {:?}", program.err());
     let prog = program.unwrap();
     assert!(!prog.map_fds().is_empty(), "printk should have maps");
-    assert!(prog.bytecode().len() >= 16, "bytecode too short: {}", prog.bytecode().len());
+    assert!(
+        prog.bytecode().len() >= 16,
+        "bytecode too short: {}",
+        prog.bytecode().len()
+    );
 }
 
 /// Load hprobe_entry.o — kprobe program capturing PC and args.
@@ -150,7 +154,11 @@ fn test_load_elf_hprobe_entry() {
 fn test_load_elf_hprobe_exit() {
     let elf_bytes = include_bytes!("../../../target/bpf/hprobe_exit.o");
     let program = EbpfProgram::new(elf_bytes, None);
-    assert!(program.is_ok(), "hprobe_exit.o should load: {:?}", program.err());
+    assert!(
+        program.is_ok(),
+        "hprobe_exit.o should load: {:?}",
+        program.err()
+    );
     let prog = program.unwrap();
     assert!(!prog.map_fds().is_empty(), "hprobe_exit should have maps");
 }
@@ -160,5 +168,9 @@ fn test_load_elf_hprobe_exit() {
 fn test_load_program_elf() {
     let elf_bytes = include_bytes!("../../../target/bpf/printk.o");
     let prog_id = runtime::load_program(elf_bytes, None);
-    assert!(prog_id.is_ok(), "load_program with ELF should work: {:?}", prog_id.err());
+    assert!(
+        prog_id.is_ok(),
+        "load_program with ELF should work: {:?}",
+        prog_id.err()
+    );
 }

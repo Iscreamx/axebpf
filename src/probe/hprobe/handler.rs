@@ -14,7 +14,7 @@
 use super::manager::KPROBE_REGISTRY;
 
 /// BRK immediate values used by kprobe library.
-const KPROBES_BRK_IMM: u64 = 0x004;    // Main breakpoint (BRK #4)
+const KPROBES_BRK_IMM: u64 = 0x004; // Main breakpoint (BRK #4)
 const KPROBES_BRK_SS_IMM: u64 = 0x006; // Single-step complete (BRK #6)
 
 /// Size of TrapFrame (Aarch64ContextFrame) that overlaps with kprobe::PtRegs.
@@ -83,7 +83,9 @@ pub fn handle_breakpoint(regs_ptr: *mut u8, regs_size: usize, iss: u64) -> bool 
     if regs_ptr.is_null() || regs_size < TRAPFRAME_COMPAT_SIZE {
         log::warn!(
             "hprobe_handler: invalid regs_ptr ({:?}) or size ({} < {})",
-            regs_ptr, regs_size, TRAPFRAME_COMPAT_SIZE
+            regs_ptr,
+            regs_size,
+            TRAPFRAME_COMPAT_SIZE
         );
         return false;
     }
@@ -151,10 +153,8 @@ fn handle_brk_main(pt_regs: &mut kprobe::PtRegs) -> bool {
 
         #[cfg(all(feature = "runtime", feature = "tracepoint-support"))]
         if entry_hit {
-            let mut event = crate::event::TraceEvent::new(
-                crate::event::PROBE_HPROBE,
-                probe_addr as u32,
-            );
+            let mut event =
+                crate::event::TraceEvent::new(crate::event::PROBE_HPROBE, probe_addr as u32);
             event.name_offset = crate::event::register_event_name("hprobe");
             event.nr_args = 4;
             event.args[0] = arg_at(pt_regs, 0);

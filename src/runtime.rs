@@ -72,10 +72,7 @@ fn is_elf(data: &[u8]) -> bool {
 /// - `R_BPF_64_64` map fd relocations
 /// - `R_BPF_64_32` function call relocations (BPF-to-BPF)
 /// - BTF-defined and legacy map sections
-fn parse_elf_with_aya(
-    elf_data: &[u8],
-    prog_name: Option<&str>,
-) -> Result<ElfParseResult, Error> {
+fn parse_elf_with_aya(elf_data: &[u8], prog_name: Option<&str>) -> Result<ElfParseResult, Error> {
     use aya_obj::Object;
     use hashbrown::HashSet;
 
@@ -93,7 +90,10 @@ fn parse_elf_with_aya(
     // so we must copy to an aligned buffer when the pointer is misaligned.
     let aligned_buf;
     let parse_data = if !(elf_data.as_ptr() as usize).is_multiple_of(8) {
-        log::debug!("ELF data not 8-byte aligned (ptr={:#x}), copying to aligned buffer", elf_data.as_ptr() as usize);
+        log::debug!(
+            "ELF data not 8-byte aligned (ptr={:#x}), copying to aligned buffer",
+            elf_data.as_ptr() as usize
+        );
         aligned_buf = elf_data.to_vec();
         aligned_buf.as_slice()
     } else {
@@ -117,15 +117,16 @@ fn parse_elf_with_aya(
 
     for (name, map) in &obj.maps {
         let map_type = match map.map_type() {
-            1 => crate::maps::MapType::HashMap,   // BPF_MAP_TYPE_HASH
-            2 => crate::maps::MapType::Array,      // BPF_MAP_TYPE_ARRAY
-            9 => crate::maps::MapType::LruHash,    // BPF_MAP_TYPE_LRU_HASH
-            22 => crate::maps::MapType::Queue,     // BPF_MAP_TYPE_QUEUE
-            27 => crate::maps::MapType::RingBuf,   // BPF_MAP_TYPE_RINGBUF
+            1 => crate::maps::MapType::HashMap,  // BPF_MAP_TYPE_HASH
+            2 => crate::maps::MapType::Array,    // BPF_MAP_TYPE_ARRAY
+            9 => crate::maps::MapType::LruHash,  // BPF_MAP_TYPE_LRU_HASH
+            22 => crate::maps::MapType::Queue,   // BPF_MAP_TYPE_QUEUE
+            27 => crate::maps::MapType::RingBuf, // BPF_MAP_TYPE_RINGBUF
             unsupported => {
                 log::warn!(
                     "map '{}': unsupported BPF map type {} (supported: Hash=1, Array=2, LRU=9, Queue=22, RingBuf=27)",
-                    name, unsupported
+                    name,
+                    unsupported
                 );
                 // Cleanup already created maps
                 for (_, fd) in &map_fds {
@@ -177,9 +178,9 @@ fn parse_elf_with_aya(
         let maps_for_reloc: Vec<(&str, core::ffi::c_int, &aya_obj::maps::Map)> = map_fds
             .iter()
             .filter_map(|(name, fd)| {
-                taken_maps.get(name.as_str()).map(|map| {
-                    (name.as_str(), *fd as core::ffi::c_int, map)
-                })
+                taken_maps
+                    .get(name.as_str())
+                    .map(|map| (name.as_str(), *fd as core::ffi::c_int, map))
             })
             .collect();
 
@@ -213,8 +214,11 @@ fn parse_elf_with_aya(
     // Phase 4: Select program and extract bytecode
     let program = match prog_name {
         Some(name) => obj.programs.get(name).ok_or_else(|| {
-            log::warn!("Program '{}' not found in ELF (available: {:?})",
-                name, obj.programs.keys().collect::<Vec<_>>());
+            log::warn!(
+                "Program '{}' not found in ELF (available: {:?})",
+                name,
+                obj.programs.keys().collect::<Vec<_>>()
+            );
             Error::NotFound
         })?,
         None => obj.programs.values().next().ok_or_else(|| {
@@ -234,10 +238,7 @@ fn parse_elf_with_aya(
     // bpf_insn is #[repr(C)], 8 bytes each, safe to reinterpret as bytes.
     let insn_count = function.instructions.len();
     let bytecode: Vec<u8> = unsafe {
-        core::slice::from_raw_parts(
-            function.instructions.as_ptr() as *const u8,
-            insn_count * 8,
-        )
+        core::slice::from_raw_parts(function.instructions.as_ptr() as *const u8, insn_count * 8)
     }
     .to_vec();
 

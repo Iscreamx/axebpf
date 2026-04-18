@@ -35,7 +35,12 @@ pub fn alloc_slot() -> Option<usize> {
         if (*bitmap & (1u64 << i)) == 0 {
             *bitmap |= 1u64 << i;
             let addr = unsafe { addr_of!(INSN_SLOTS[i]) as usize };
-            log::info!("insn_slot: allocated slot {} at {:#x} (base={:#x})", i, addr, slots_base());
+            log::info!(
+                "insn_slot: allocated slot {} at {:#x} (base={:#x})",
+                i,
+                addr,
+                slots_base()
+            );
             return Some(addr);
         }
     }

@@ -53,8 +53,11 @@ fn unhprobe_removes_both_entry_and_ret_slots() {
     hprobe_manager::detach(symbol).unwrap();
 
     let probes = hprobe_manager::list_all();
-    let still_present = probes.into_iter().any(|(name, probe_addr, _, _, _, _)| {
-        name == symbol && probe_addr == addr
-    });
-    assert!(!still_present, "all probe slots must be removed by unhprobe");
+    let still_present = probes
+        .into_iter()
+        .any(|(name, probe_addr, _, _, _, _)| name == symbol && probe_addr == addr);
+    assert!(
+        !still_present,
+        "all probe slots must be removed by unhprobe"
+    );
 }

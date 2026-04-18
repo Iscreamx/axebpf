@@ -2,14 +2,14 @@
 
 use alloc::collections::BTreeMap;
 use axebpf::probe::kprobe::addr_translate::{GuestPtReader, gva_to_gpa_with};
-use axerrno::AxResult;
 #[cfg(feature = "test-utils")]
 use axebpf::probe::kprobe::addr_translate::{
-    clear_guest_pt_read_hook_for_test, clear_gva_to_hva_hook_for_test, clear_vm_ttbr1_hook_for_test,
-    clear_gpa_to_hpa_hook_for_test, gpa_to_hpa, register_gpa_to_hpa_hook,
-    gva_to_gpa_with_vm, gva_to_hva_for_vm, register_guest_pt_read_hook, register_gva_to_hva_hook,
-    register_vm_ttbr1_hook,
+    clear_gpa_to_hpa_hook_for_test, clear_guest_pt_read_hook_for_test,
+    clear_gva_to_hva_hook_for_test, clear_vm_ttbr1_hook_for_test, gpa_to_hpa, gva_to_gpa_with_vm,
+    gva_to_hva_for_vm, register_gpa_to_hpa_hook, register_guest_pt_read_hook,
+    register_gva_to_hva_hook, register_vm_ttbr1_hook,
 };
+use axerrno::AxResult;
 
 extern crate alloc;
 

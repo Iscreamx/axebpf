@@ -29,7 +29,9 @@ impl Drop for LiveGuestRuntimeStateGuard {
     }
 }
 
-pub fn install_live_guest_runtime_state(state: LiveGuestRuntimeState) -> LiveGuestRuntimeStateGuard {
+pub fn install_live_guest_runtime_state(
+    state: LiveGuestRuntimeState,
+) -> LiveGuestRuntimeStateGuard {
     let cpu_id = crate::platform::cpu_id();
     LIVE_GUEST_RUNTIME_STATES.lock().insert(cpu_id, state);
     LiveGuestRuntimeStateGuard { cpu_id }

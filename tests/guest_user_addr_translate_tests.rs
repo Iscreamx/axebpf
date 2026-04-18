@@ -2,12 +2,12 @@
 
 use std::sync::Mutex;
 
-use axebpf::probe::uprobe::addr_translate::{
-    gva_to_gpa_user_with_vm, register_guest_pt_read_hook, register_vm_ttbr0_hook,
-};
 use axebpf::probe::guest_runtime_state::{
     LiveGuestRuntimeState, clear_live_guest_runtime_state_for_test,
     install_live_guest_runtime_state,
+};
+use axebpf::probe::uprobe::addr_translate::{
+    gva_to_gpa_user_with_vm, register_guest_pt_read_hook, register_vm_ttbr0_hook,
 };
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());

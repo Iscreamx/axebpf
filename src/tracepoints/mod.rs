@@ -17,11 +17,7 @@ pub mod vmm;
 
 // Re-export VMM tracepoint trigger functions
 pub use vmm::{
-    trace_config_load,
-    trace_image_load,
-    trace_timer_event,
-    trace_timer_tick,
-    trace_vm_destroy,
+    trace_config_load, trace_image_load, trace_timer_event, trace_timer_tick, trace_vm_destroy,
     trace_vmm_init,
 };
 

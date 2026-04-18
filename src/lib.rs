@@ -62,11 +62,7 @@ pub mod insn_slot;
 #[cfg(feature = "tracepoint-support")]
 pub mod page_table;
 
-#[cfg(any(
-    feature = "hprobe",
-    feature = "guest-kprobe",
-    feature = "guest-uprobe"
-))]
+#[cfg(any(feature = "hprobe", feature = "guest-kprobe", feature = "guest-uprobe"))]
 pub mod probe;
 
 #[cfg(feature = "guest-kprobe")]
@@ -150,9 +146,9 @@ pub use event::{
 pub use kprobe::PtRegs;
 
 #[cfg(feature = "hprobe")]
-pub use probe::hprobe::manager as hprobe_manager;
-#[cfg(feature = "hprobe")]
 pub use probe::hprobe::handler as hprobe_handler;
+#[cfg(feature = "hprobe")]
+pub use probe::hprobe::manager as hprobe_manager;
 #[cfg(feature = "hprobe")]
 pub use probe::hprobe::ops as hprobe_ops;
 
@@ -225,13 +221,20 @@ pub fn init_with_symbols(kallsyms_data: &'static [u8], stext: u64, etext: u64) {
 
     // Initialize symbol table first
     info!("  - symbols module enabled");
-    info!("    - kallsyms data at {:p}, len={}", kallsyms_data.as_ptr(), kallsyms_data.len());
+    info!(
+        "    - kallsyms data at {:p}, len={}",
+        kallsyms_data.as_ptr(),
+        kallsyms_data.len()
+    );
 
     // The ksym library expects the blob to be page-aligned in memory.
     // Check alignment and warn if not aligned.
     let ptr = kallsyms_data.as_ptr() as usize;
     if !ptr.is_multiple_of(4096) {
-        warn!("    - kallsyms data is not page-aligned (ptr % 4096 = {})", ptr % 4096);
+        warn!(
+            "    - kallsyms data is not page-aligned (ptr % 4096 = {})",
+            ptr % 4096
+        );
         warn!("    - this may cause parsing issues with ksym library");
     }
 
@@ -283,7 +286,6 @@ pub fn cleanup_vm(vm_id: u32) {
     probe::uprobe::object::unload_vm(vm_id);
     info!(
         "axebpf: cleaned up vm{} ({} probes detached)",
-        vm_id,
-        detached
+        vm_id, detached
     );
 }

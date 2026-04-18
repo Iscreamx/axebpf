@@ -116,7 +116,9 @@ impl KernelAuxiliaryOps for AxKernelAuxOps {
             .alloc_pages(1, page_size, axalloc::UsageKind::VirtMem)
             .map_err(|_| BpfError::NoSpace)?;
         // Zero the page
-        unsafe { core::ptr::write_bytes(vaddr as *mut u8, 0, page_size); }
+        unsafe {
+            core::ptr::write_bytes(vaddr as *mut u8, 0, page_size);
+        }
         // Convert VA to PA for kbpf-basic
         let paddr = virt_to_phys(vaddr);
         log::debug!("alloc_page: vaddr={:#x} paddr={:#x}", vaddr, paddr);

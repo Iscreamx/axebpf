@@ -204,7 +204,14 @@ impl GuestKprobeRegistry {
         is_ret: bool,
         mode: KprobeMode,
     ) -> Result<(), &'static str> {
-        self.register_inner(vm_id, gva, prog_id, is_ret, mode, RegisterOptions::default())
+        self.register_inner(
+            vm_id,
+            gva,
+            prog_id,
+            is_ret,
+            mode,
+            RegisterOptions::default(),
+        )
     }
 
     pub fn register_hidden(

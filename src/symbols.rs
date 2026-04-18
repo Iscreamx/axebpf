@@ -131,7 +131,9 @@ pub fn search_symbols(pattern: &str, max_results: usize) -> alloc::vec::Vec<(Str
         let parts: Vec<&str> = line.splitn(3, ' ').collect();
         if parts.len() >= 3 {
             let name = parts[2];
-            if name.contains(pattern) && let Ok(addr) = u64::from_str_radix(parts[0], 16) {
+            if name.contains(pattern)
+                && let Ok(addr) = u64::from_str_radix(parts[0], 16)
+            {
                 results.push((String::from(name), addr));
             }
         }

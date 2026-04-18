@@ -121,7 +121,10 @@ ffff800080002000 T foo
 
     let count = guest_symbols::load_from_text(vm_id, content).unwrap();
     assert_eq!(count, 1);
-    assert_eq!(guest_symbols::lookup_addr(vm_id, "foo"), Some(0xffff800080002000));
+    assert_eq!(
+        guest_symbols::lookup_addr(vm_id, "foo"),
+        Some(0xffff800080002000)
+    );
 
     let nearest_old = guest_symbols::lookup_name(vm_id, 0xffff800080001000);
     assert!(nearest_old.is_none());

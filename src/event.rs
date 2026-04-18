@@ -184,7 +184,10 @@ pub fn init_ringbuf_with_size(size_kb: u32) {
     };
 
     if size_bytes == 0 || (size_bytes & (size_bytes - 1)) != 0 || (size_bytes % PAGE_SIZE) != 0 {
-        log::error!("RingBuf size must be power-of-2 and page-aligned, got {}KB", size_kb);
+        log::error!(
+            "RingBuf size must be power-of-2 and page-aligned, got {}KB",
+            size_kb
+        );
         return;
     }
 
@@ -222,7 +225,11 @@ fn fallback_push(event: TraceEvent) {
 fn fallback_pop(max_events: usize) -> Vec<TraceEvent> {
     let mut q = FALLBACK_EVENTS.lock();
     let mut out = Vec::new();
-    let limit = if max_events == 0 { usize::MAX } else { max_events };
+    let limit = if max_events == 0 {
+        usize::MAX
+    } else {
+        max_events
+    };
 
     while out.len() < limit {
         match q.pop_front() {
@@ -263,7 +270,11 @@ pub fn ringbuf_push(event: &TraceEvent) -> bool {
 /// `max_events == 0` means no explicit limit.
 pub fn consume_events(max_events: usize) -> Vec<TraceEvent> {
     let mut events = Vec::new();
-    let limit = if max_events == 0 { usize::MAX } else { max_events };
+    let limit = if max_events == 0 {
+        usize::MAX
+    } else {
+        max_events
+    };
 
     if let Some(fd) = ringbuf_fd() {
         use crate::map_ops::AxKernelAuxOps;

@@ -16,5 +16,8 @@ ffff800080002000 T vm_mmap_pgoff\n",
 
     linux_runtime_observer::clear_all_for_test();
 
-    assert_eq!(linux_runtime_observer::ensure_registered_for_vm(9).unwrap(), 3);
+    assert_eq!(
+        linux_runtime_observer::ensure_registered_for_vm(9).unwrap(),
+        3
+    );
 }

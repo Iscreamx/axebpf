@@ -113,7 +113,11 @@ pub fn search(vm_id: u32, pattern: &str, max_results: usize) -> Vec<(u64, String
             break;
         }
         if name.contains(pattern) {
-            let sym_type = table.addr_to_name.get(&addr).map(|(_, ty)| *ty).unwrap_or('?');
+            let sym_type = table
+                .addr_to_name
+                .get(&addr)
+                .map(|(_, ty)| *ty)
+                .unwrap_or('?');
             results.push((addr, name.clone(), sym_type));
         }
     }
@@ -135,5 +139,8 @@ pub fn unload(vm_id: u32) {
 /// Get loaded symbol count for one VM.
 pub fn symbol_count(vm_id: u32) -> usize {
     let tables = GUEST_SYMBOL_TABLES.lock();
-    tables.get(&vm_id).map(|t| t.name_to_addr.len()).unwrap_or(0)
+    tables
+        .get(&vm_id)
+        .map(|t| t.name_to_addr.len())
+        .unwrap_or(0)
 }

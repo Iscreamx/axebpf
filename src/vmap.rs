@@ -35,11 +35,11 @@ static VMAP_REGIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 #[cfg(all(target_arch = "aarch64", feature = "axhal"))]
 mod pte {
     pub const VALID: u64 = 1 << 0;
-    pub const TABLE: u64 = 1 << 1;       // table descriptor (L0-L2)
-    pub const PAGE: u64 = 1 << 1;        // page descriptor (L3, same bit)
-    pub const AF: u64 = 1 << 10;         // access flag
-    pub const SH_ISH: u64 = 0b11 << 8;   // inner shareable
-    pub const AP_RW: u64 = 0b00 << 6;    // EL2 R/W
+    pub const TABLE: u64 = 1 << 1; // table descriptor (L0-L2)
+    pub const PAGE: u64 = 1 << 1; // page descriptor (L3, same bit)
+    pub const AF: u64 = 1 << 10; // access flag
+    pub const SH_ISH: u64 = 0b11 << 8; // inner shareable
+    pub const AP_RW: u64 = 0b00 << 6; // EL2 R/W
     pub const ATTR_IDX_NORMAL: u64 = 0 << 2; // normal memory (MAIR index 0)
     pub const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
@@ -90,7 +90,9 @@ fn alloc_table_page() -> Option<u64> {
     let vaddr = axalloc::global_allocator()
         .alloc_pages(1, PAGE_SIZE, axalloc::UsageKind::PageTable)
         .ok()?;
-    unsafe { core::ptr::write_bytes(vaddr as *mut u8, 0, PAGE_SIZE); }
+    unsafe {
+        core::ptr::write_bytes(vaddr as *mut u8, 0, PAGE_SIZE);
+    }
     Some(virt_to_phys(vaddr))
 }
 
@@ -117,7 +119,9 @@ fn get_or_create_table(table_paddr: u64, index: usize) -> Option<u64> {
         // Allocate new table page
         let new_table_paddr = alloc_table_page()?;
         let new_entry = new_table_paddr | pte::TABLE_FLAGS;
-        unsafe { core::ptr::write_volatile(entry_ptr, new_entry); }
+        unsafe {
+            core::ptr::write_volatile(entry_ptr, new_entry);
+        }
         Some(new_table_paddr)
     }
 }
@@ -151,7 +155,9 @@ fn map_page(vaddr: usize, paddr: usize) -> bool {
     let l3_vaddr = phys_to_virt(l3_paddr);
     let entry_ptr = (l3_vaddr + l3_idx * 8) as *mut u64;
     let entry = (paddr as u64 & pte::ADDR_MASK) | pte::L3_PAGE_FLAGS;
-    unsafe { core::ptr::write_volatile(entry_ptr, entry); }
+    unsafe {
+        core::ptr::write_volatile(entry_ptr, entry);
+    }
 
     true
 }
@@ -169,19 +175,27 @@ fn unmap_page(vaddr: usize) {
     // Walk existing tables — don't create new ones
     let l0_vaddr = phys_to_virt(root_paddr);
     let l0_entry = unsafe { core::ptr::read_volatile((l0_vaddr + l0_idx * 8) as *const u64) };
-    if l0_entry & pte::VALID == 0 { return; }
+    if l0_entry & pte::VALID == 0 {
+        return;
+    }
 
     let l1_vaddr = phys_to_virt(l0_entry & pte::ADDR_MASK);
     let l1_entry = unsafe { core::ptr::read_volatile((l1_vaddr + l1_idx * 8) as *const u64) };
-    if l1_entry & pte::VALID == 0 { return; }
+    if l1_entry & pte::VALID == 0 {
+        return;
+    }
 
     let l2_vaddr = phys_to_virt(l1_entry & pte::ADDR_MASK);
     let l2_entry = unsafe { core::ptr::read_volatile((l2_vaddr + l2_idx * 8) as *const u64) };
-    if l2_entry & pte::VALID == 0 { return; }
+    if l2_entry & pte::VALID == 0 {
+        return;
+    }
 
     let l3_vaddr = phys_to_virt(l2_entry & pte::ADDR_MASK);
     let entry_ptr = (l3_vaddr + l3_idx * 8) as *mut u64;
-    unsafe { core::ptr::write_volatile(entry_ptr, 0); }
+    unsafe {
+        core::ptr::write_volatile(entry_ptr, 0);
+    }
 }
 
 /// Map an array of physical pages into a contiguous virtual address range.
@@ -209,7 +223,12 @@ pub fn vmap(phys_addrs: &[usize]) -> Option<usize> {
     for (i, &paddr) in phys_addrs.iter().enumerate() {
         let page_vaddr = vaddr + i * PAGE_SIZE;
         if !map_page(page_vaddr, paddr) {
-            log::error!("vmap: failed to map page {} at vaddr={:#x} paddr={:#x}", i, page_vaddr, paddr);
+            log::error!(
+                "vmap: failed to map page {} at vaddr={:#x} paddr={:#x}",
+                i,
+                page_vaddr,
+                paddr
+            );
             // Unmap already-mapped pages
             for j in 0..i {
                 unmap_page(vaddr + j * PAGE_SIZE);
@@ -226,7 +245,9 @@ pub fn vmap(phys_addrs: &[usize]) -> Option<usize> {
 
     log::info!(
         "vmap: mapped {} pages at {:#x}..{:#x}",
-        nr_pages, vaddr, vaddr + nr_pages * PAGE_SIZE
+        nr_pages,
+        vaddr,
+        vaddr + nr_pages * PAGE_SIZE
     );
 
     Some(vaddr)

@@ -26,7 +26,7 @@ pub fn flush_icache_range(start: usize, end: usize) {
         }
 
         core::arch::asm!(
-            "dsb ish",              // Data synchronization barrier
+            "dsb ish", // Data synchronization barrier
             options(nostack, preserves_flags)
         );
 
@@ -39,7 +39,7 @@ pub fn flush_icache_range(start: usize, end: usize) {
         }
 
         core::arch::asm!(
-            "dsb ish",              // Ensure local IC invalidation complete
+            "dsb ish", // Ensure local IC invalidation complete
             options(nostack, preserves_flags)
         );
 

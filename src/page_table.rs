@@ -65,7 +65,11 @@ unsafe fn walk_page_table(vaddr: usize) -> Option<*mut u64> {
     // Convert physical address to virtual address for access
     let root_virt = phys_to_virt(root_phys);
 
-    log::trace!("page_table: root_phys={:#x}, root_virt={:#x}", root_phys, root_virt);
+    log::trace!(
+        "page_table: root_phys={:#x}, root_virt={:#x}",
+        root_phys,
+        root_virt
+    );
 
     // 4-level page table indices (9 bits each)
     let l0_idx = (vaddr >> 39) & 0x1FF;
@@ -130,10 +134,10 @@ unsafe fn walk_page_table(vaddr: usize) -> Option<*mut u64> {
 fn flush_tlb() {
     unsafe {
         core::arch::asm!(
-            "dsb ishst",        // Ensure PTE write is visible
-            "tlbi alle2is",     // Invalidate all EL2 TLB entries (inner shareable)
-            "dsb ish",          // Wait for TLB invalidation
-            "isb",              // Synchronize context
+            "dsb ishst",    // Ensure PTE write is visible
+            "tlbi alle2is", // Invalidate all EL2 TLB entries (inner shareable)
+            "dsb ish",      // Wait for TLB invalidation
+            "isb",          // Synchronize context
             options(nostack, preserves_flags)
         );
     }
@@ -155,7 +159,9 @@ pub fn set_kernel_text_writable(addr: usize, size: usize, writable: bool) -> boo
 
     log::info!(
         "page_table: set_kernel_text_writable {:#x}-{:#x} writable={}",
-        start_page, end_page, writable
+        start_page,
+        end_page,
+        writable
     );
 
     // Read TTBR0_EL2 to verify it's accessible
@@ -171,16 +177,18 @@ pub fn set_kernel_text_writable(addr: usize, size: usize, writable: bool) -> boo
                 let old_pte = pte;
 
                 if writable {
-                    pte &= !AP_RO_BIT;  // Clear AP[2] -> RW
+                    pte &= !AP_RO_BIT; // Clear AP[2] -> RW
                 } else {
-                    pte |= AP_RO_BIT;   // Set AP[2] -> RO
+                    pte |= AP_RO_BIT; // Set AP[2] -> RO
                 }
 
                 if pte != old_pte {
                     core::ptr::write_volatile(pte_ptr, pte);
                     log::trace!(
                         "page_table: modified PTE for {:#x}: {:#x} -> {:#x}",
-                        page, old_pte, pte
+                        page,
+                        old_pte,
+                        pte
                     );
                 }
             } else {
