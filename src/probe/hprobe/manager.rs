@@ -8,6 +8,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
 use crate::probe::hprobe::ops::AxKprobeOps;
@@ -46,6 +47,26 @@ struct HprobeUserData {
     prog_id: u32,
     probe_addr: usize,
     symbol: String,
+    verbose_hits: Arc<AtomicU64>,
+}
+
+/// Keep the first few verbose hits visible, then fall back to periodic sampling.
+const VERBOSE_HIT_LOG_BURST: u64 = 8;
+const VERBOSE_HIT_LOG_INTERVAL: u64 = 256;
+
+#[inline]
+const fn should_log_verbose_hit(hit: u64) -> bool {
+    hit != 0 && (hit <= VERBOSE_HIT_LOG_BURST || hit.is_multiple_of(VERBOSE_HIT_LOG_INTERVAL))
+}
+
+#[inline]
+fn next_verbose_hit(counter: &AtomicU64) -> Option<u64> {
+    let hit = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if should_log_verbose_hit(hit) {
+        Some(hit)
+    } else {
+        None
+    }
 }
 
 /// Kprobe state
@@ -208,6 +229,7 @@ impl KprobeRegistry {
         if already_enabled {
             return Ok(());
         }
+        let verbose_hits = Arc::new(AtomicU64::new(0));
 
         let handle = if is_ret {
             let ret_builder = kprobe::KretprobeBuilder::<LockType>::new(16)
@@ -220,6 +242,7 @@ impl KprobeRegistry {
                     prog_id,
                     probe_addr: addr,
                     symbol: symbol.clone(),
+                    verbose_hits: verbose_hits.clone(),
                 });
 
             let kretprobe =
@@ -235,6 +258,7 @@ impl KprobeRegistry {
                     prog_id,
                     probe_addr: addr,
                     symbol: symbol.clone(),
+                    verbose_hits,
                 });
 
             let kp = kprobe::register_kprobe(&mut self.manager, &mut self.probe_points, builder);
@@ -410,14 +434,22 @@ fn kprobe_pre_handler(data: &dyn kprobe::ProbeData, pt_regs: &mut kprobe::PtRegs
             )
         };
         if let Err(e) = crate::runtime::run_program(ud.prog_id, Some(ctx_bytes)) {
-            log::warn!("hprobe: eBPF execution failed at {:#x}: {:?}", ud.probe_addr, e);
+            log::warn!(
+                "hprobe: eBPF execution failed at {:#x}: {:?}",
+                ud.probe_addr,
+                e
+            );
         }
 
-        if crate::attach::is_verbose() {
+        if crate::attach::is_verbose()
+            && let Some(hit) = next_verbose_hit(&ud.verbose_hits)
+        {
             let regs = &*pt_regs;
             log::info!(
-                "[hprobe] ENTRY {} x0={:#x} x1={:#x} x2={:#x} x3={:#x}",
+                "[hprobe] ENTRY {} hit={} sampled={} x0={:#x} x1={:#x} x2={:#x} x3={:#x}",
                 ud.symbol,
+                hit,
+                hit > VERBOSE_HIT_LOG_BURST,
                 arg_at(regs, 0),
                 arg_at(regs, 1),
                 arg_at(regs, 2),
@@ -449,14 +481,22 @@ fn kprobe_ret_handler(data: &dyn kprobe::ProbeData, pt_regs: &mut kprobe::PtRegs
             )
         };
         if let Err(e) = crate::runtime::run_program(ud.prog_id, Some(ctx_bytes)) {
-            log::warn!("hretprobe: eBPF execution failed at {:#x}: {:?}", ud.probe_addr, e);
+            log::warn!(
+                "hretprobe: eBPF execution failed at {:#x}: {:?}",
+                ud.probe_addr,
+                e
+            );
         }
 
-        if crate::attach::is_verbose() {
+        if crate::attach::is_verbose()
+            && let Some(hit) = next_verbose_hit(&ud.verbose_hits)
+        {
             let regs = &*pt_regs;
             log::info!(
-                "[hprobe] EXIT {} retval={:#x}",
+                "[hprobe] EXIT {} hit={} sampled={} retval={:#x}",
                 ud.symbol,
+                hit,
+                hit > VERBOSE_HIT_LOG_BURST,
                 arg_at(regs, 0)
             );
         }
@@ -468,8 +508,7 @@ fn kprobe_ret_handler(data: &dyn kprobe::ProbeData, pt_regs: &mut kprobe::PtRegs
 
 #[cfg(all(feature = "runtime", feature = "tracepoint-support"))]
 fn emit_hretprobe_event(probe_addr: usize, retval: u64) {
-    let mut event =
-        crate::event::TraceEvent::new(crate::event::PROBE_HRETPROBE, probe_addr as u32);
+    let mut event = crate::event::TraceEvent::new(crate::event::PROBE_HRETPROBE, probe_addr as u32);
     event.name_offset = crate::event::register_event_name("hretprobe");
     event.nr_args = 1;
     event.args[0] = retval;
@@ -478,8 +517,7 @@ fn emit_hretprobe_event(probe_addr: usize, retval: u64) {
 
 /// Initialize the kprobe subsystem.
 pub fn init() {
-    static INITIALIZED: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
+    static INITIALIZED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
     if INITIALIZED.swap(true, core::sync::atomic::Ordering::SeqCst) {
         return; // Already initialized
@@ -497,28 +535,36 @@ pub fn init() {
 /// Register a kprobe by symbol name.
 pub fn register(name: &str, prog_id: u32, is_ret: bool) -> Result<usize, &'static str> {
     let mut registry = KPROBE_REGISTRY.lock();
-    let registry = registry.as_mut().ok_or("kprobe subsystem not initialized")?;
+    let registry = registry
+        .as_mut()
+        .ok_or("kprobe subsystem not initialized")?;
     registry.register(name, prog_id, is_ret)
 }
 
 /// Enable a kprobe slot.
 pub fn enable(addr: usize, is_ret: bool) -> Result<(), &'static str> {
     let mut registry = KPROBE_REGISTRY.lock();
-    let registry = registry.as_mut().ok_or("kprobe subsystem not initialized")?;
+    let registry = registry
+        .as_mut()
+        .ok_or("kprobe subsystem not initialized")?;
     registry.enable(addr, is_ret)
 }
 
 /// Disable a kprobe slot.
 pub fn disable(addr: usize, is_ret: bool) -> Result<(), &'static str> {
     let mut registry = KPROBE_REGISTRY.lock();
-    let registry = registry.as_mut().ok_or("kprobe subsystem not initialized")?;
+    let registry = registry
+        .as_mut()
+        .ok_or("kprobe subsystem not initialized")?;
     registry.disable(addr, is_ret)
 }
 
 /// Unregister a kprobe slot.
 pub fn unregister(addr: usize, is_ret: bool) -> Result<(), &'static str> {
     let mut registry = KPROBE_REGISTRY.lock();
-    let registry = registry.as_mut().ok_or("kprobe subsystem not initialized")?;
+    let registry = registry
+        .as_mut()
+        .ok_or("kprobe subsystem not initialized")?;
     registry.unregister(addr, is_ret)
 }
 
@@ -544,7 +590,9 @@ pub fn attach(name: &str, prog_id: u32, is_ret: bool) -> Result<usize, &'static 
 /// Disable and unregister a kprobe by name.
 pub fn detach(name: &str) -> Result<(), &'static str> {
     let mut registry = KPROBE_REGISTRY.lock();
-    let registry = registry.as_mut().ok_or("kprobe subsystem not initialized")?;
+    let registry = registry
+        .as_mut()
+        .ok_or("kprobe subsystem not initialized")?;
     registry.unregister_by_name(name)
 }
 
@@ -557,12 +605,24 @@ pub fn register_with_addr_for_test(
     is_ret: bool,
 ) -> Result<usize, &'static str> {
     let mut registry = KPROBE_REGISTRY.lock();
-    let registry = registry.as_mut().ok_or("kprobe subsystem not initialized")?;
+    let registry = registry
+        .as_mut()
+        .ok_or("kprobe subsystem not initialized")?;
     registry.register_with_addr(name, addr, prog_id, is_ret)
 }
 
-#[cfg(all(feature = "test-utils", feature = "runtime", feature = "tracepoint-support"))]
+#[cfg(all(
+    feature = "test-utils",
+    feature = "runtime",
+    feature = "tracepoint-support"
+))]
 /// Test helper: emit one synthetic hretprobe event without trap handling.
 pub fn emit_hretprobe_event_for_test(probe_addr: usize, retval: u64) {
     emit_hretprobe_event(probe_addr, retval);
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+/// Test helper: expose verbose hit sampling policy for regression tests.
+pub fn should_log_verbose_hit_for_test(hit: u64) -> bool {
+    should_log_verbose_hit(hit)
 }

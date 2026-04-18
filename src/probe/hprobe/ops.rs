@@ -24,15 +24,18 @@ impl kprobe::KprobeAuxiliaryOps for AxKprobeOps {
         let dst_addr = dst as usize;
         let is_slot = insn_slot::is_slot_address(dst_addr);
 
-        log::info!(
+        log::debug!(
             "copy_memory: src={:#x} dst={:#x} len={} is_slot={}",
-            src as usize, dst_addr, len, is_slot
+            src as usize,
+            dst_addr,
+            len,
+            is_slot
         );
 
         // Check if destination is in instruction slot region (part of .text)
         if is_slot {
             // Instruction slots are in .text, need to make writable first
-            log::info!("copy_memory: making slot writable");
+            log::debug!("copy_memory: making slot writable");
             if !page_table::set_kernel_text_writable(dst_addr, len, true) {
                 log::error!("copy_memory: failed to make slot {:#x} writable", dst_addr);
                 return;
@@ -45,7 +48,7 @@ impl kprobe::KprobeAuxiliaryOps for AxKprobeOps {
             // Restore read-only and flush I-cache
             page_table::set_kernel_text_writable(dst_addr, len, false);
             crate::cache::flush_icache_range(dst_addr, dst_addr + len);
-            log::info!("copy_memory: slot write complete");
+            log::debug!("copy_memory: slot write complete");
         } else {
             // Regular memory, just copy
             unsafe {
@@ -61,18 +64,19 @@ impl kprobe::KprobeAuxiliaryOps for AxKprobeOps {
         _user_pid: Option<i32>,
         action: F,
     ) {
-        log::info!("set_writeable_for_address: addr={:#x} len={}", address, len);
+        log::debug!("set_writeable_for_address: addr={:#x} len={}", address, len);
 
         // Read original instruction before modification
         let orig_insn = unsafe { core::ptr::read_volatile(address as *const u32) };
-        log::info!("set_writeable_for_address: original insn at {:#x} = {:#010x}", address, orig_insn);
+        log::debug!(
+            "set_writeable_for_address: original insn at {:#x} = {:#010x}",
+            address,
+            orig_insn
+        );
 
         // Make writable
         if !page_table::set_kernel_text_writable(address, len, true) {
-            log::error!(
-                "kprobe_ops: failed to make {:#x} writable",
-                address
-            );
+            log::error!("kprobe_ops: failed to make {:#x} writable", address);
             return;
         }
 
@@ -81,14 +85,18 @@ impl kprobe::KprobeAuxiliaryOps for AxKprobeOps {
 
         // Read instruction after modification
         let new_insn = unsafe { core::ptr::read_volatile(address as *const u32) };
-        log::info!("set_writeable_for_address: new insn at {:#x} = {:#010x}", address, new_insn);
+        log::debug!(
+            "set_writeable_for_address: new insn at {:#x} = {:#010x}",
+            address,
+            new_insn
+        );
 
         // Restore read-only
         page_table::set_kernel_text_writable(address, len, false);
 
         // Flush I-cache
         crate::cache::flush_icache_range(address, address + len);
-        log::info!("set_writeable_for_address: I-cache flushed");
+        log::debug!("set_writeable_for_address: I-cache flushed");
     }
 
     /// Allocate an executable memory page for instruction slots.
@@ -99,7 +107,7 @@ impl kprobe::KprobeAuxiliaryOps for AxKprobeOps {
         match insn_slot::alloc_slot() {
             Some(addr) => {
                 // Make the slot writable since kprobe library writes to it directly
-                log::info!("alloc_kernel_exec_memory: making slot {:#x} writable", addr);
+                log::debug!("alloc_kernel_exec_memory: making slot {:#x} writable", addr);
                 if !page_table::set_kernel_text_writable(addr, insn_slot::SLOT_SIZE, true) {
                     log::error!("alloc_kernel_exec_memory: failed to make slot writable");
                     insn_slot::free_slot(addr);
